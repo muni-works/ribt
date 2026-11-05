@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ribt parity</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, monospace; margin: 24px 16px; background: #fbf8f3; color: #1d1a16; }
+  table { border-collapse: collapse; } td, th { padding: 3px 10px; border-bottom: 1px solid #e6dfd4; text-align: right; }
+  th { text-align: right; font-weight: 600; } td:first-child, th:first-child { text-align: left; }
+  .bad { color: #c0392b; font-weight: 700; } .ok { color: #2e7d32; }
+</style>
+</head>
+<body>
+<h3>ribt browser parity (5 fixed lines)</h3>
+<p>native = <code>ribt-tts synth</code> on Metal (f32 weights); fp16-native = the browser pipeline run natively by <code>ribt-web-export --check</code> with the shipped weights.
+Gate: audio rel RMS vs fp16-native ≤ 1e-3 (WebGPU vs native); vs native ≤ 3e-2 (the fp16 weights' share), identical durations.</p>
+<pre id="log">loading…</pre>
+<table id="t"></table>
+<script type="module">
+import { RIBT } from "./ribt.js";
+const log = (s) => (document.getElementById("log").textContent += "\n" + s);
+const get = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
+function wav(b) {
+  const dv = new DataView(b.buffer);
+  for (let o = 12; o < b.length; ) {
+    const id = String.fromCharCode(...b.subarray(o, o + 4)), n = dv.getUint32(o + 4, true);
+    if (id === "data") return new Float32Array(b.buffer.slice(o + 8, o + 8 + n));
+    o += 8 + n;
+  }
+}
+function npy(b) { const h = new DataView(b.buffer).getUint16(8, true); return new Float32Array(b.buffer.slice(10 + h)); }
+const relRms = (a, b) => { let n = 0, d = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) { n += (a[i] - b[i]) ** 2; d += b[i] ** 2; } return Math.sqrt(n / d); };
+const maxAbs = (a, b) => { let m = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; };
+const meanAbs = (a, b) => { let m = 0; const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) m += Math.abs(a[i] - b[i]); return m / n; };
+
+const tLoad = performance.now();
+const tts = await RIBT.load({ onProgress: (p) => p.stage === "ready" && log(`load ${p.load_ms.toFixed(0)} ms (download+verify), first-bucket kernels ${p.compile_ms.toFixed(0)} ms, ready ${p.ready_ms.toFixed(0)} ms`) });
+log(`adapter: ${JSON.stringify(tts.adapterInfo.vendor || "")} ${tts.adapterInfo.architecture || ""} ${tts.adapterInfo.description || ""}`);
+const lines = (await (await fetch("parity/lines.tsv")).text()).trim().split("\n").map((l) => l.split("\t"));
+
+// cold: the first utterance after load (may compile its buckets)
+const tc = performance.now();
+const r0 = await tts.synth(lines[0][1]);
+log(`cold first utterance (${lines[0][0]}): ${(performance.now() - tc).toFixed(0)} ms → time to first audio from page start ${(performance.now() - tLoad).toFixed(0)} ms`);
+log("compiling every bucket…");
+const tw = performance.now();
+await tts.prewarm();
+log(`all ${tts.m.graphs.length} graphs compiled in ${(performance.now() - tw).toFixed(0)} ms`);
+
+const rows = [];
+let audioSec = 0, synthMs = 0;
+for (const [name, text] of lines) {
+  // warm runs: best of 3 for timing
+  let r, best = Infinity;
+  for (let k = 0; k < 3; k++) { r = await tts.synth(text); best = Math.min(best, r.timings.total_ms); }
+  audioSec += r.audio.length / r.sr; synthMs += best;
+  const nat = wav(await get(`parity/native/${name}.wav`));
+  const natMel = npy(await get(`parity/native/${name}.mel.npy`));
+  const natDurs = (await (await fetch(`parity/native/${name}.durs.txt`)).text()).split("\n")[1].trim().split(" ").map(Number);
+  const f16 = new Float32Array((await get(`parity/fp16/${name}.audio.f32`)).buffer);
+  const f16Mel = new Float32Array((await get(`parity/fp16/${name}.mel.f32`)).buffer);
+  const f16Durs = (await (await fetch(`parity/fp16/${name}.durs.txt`)).text()).trim().split(" ").map(Number);
+  rows.push({
+    name, tokens: r.tokens.length, frames: r.frames, sec: (r.audio.length / r.sr).toFixed(2), len_ok: r.audio.length === nat.length,
+    durs_vs_native: r.durs.join() === natDurs.join() ? "same" : "DIFF", durs_vs_fp16: r.durs.join() === f16Durs.join() ? "same" : "DIFF",
+    rms_vs_fp16: relRms(r.audio, f16), mel_max_vs_fp16: maxAbs(r.mel, f16Mel),
+    rms_vs_native: relRms(r.audio, nat), mel_l1_vs_native: meanAbs(r.mel, natMel),
+    ms: best, rtf: best / 1000 / (r.audio.length / r.sr),
+  });
+}
+const cols = Object.keys(rows[0]);
+const fmt = (k, v) => typeof v === "number" ? (k.startsWith("rms") || k.startsWith("mel") ? v.toExponential(2) : k === "rtf" ? v.toFixed(4) : k === "ms" ? v.toFixed(1) : v) : String(v);
+const cls = (k, v) => (k === "rms_vs_fp16" ? (v <= 1e-3 ? "ok" : "bad") : k === "rms_vs_native" ? (v <= 3e-2 ? "ok" : "bad") : /durs/.test(k) ? (v === "same" ? "ok" : "bad") : "");
+document.getElementById("t").innerHTML = `<tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr>` + rows.map((r) => `<tr>${cols.map((c) => `<td class="${cls(c, r[c])}">${fmt(c, r[c])}</td>`).join("")}</tr>`).join("");
+const pass = rows.every((r) => r.rms_vs_fp16 <= 1e-3 && r.rms_vs_native <= 3e-2 && r.durs_vs_native === "same");
+log(`warm: ${synthMs.toFixed(0)} ms for ${audioSec.toFixed(2)} s of audio, RTF ${(synthMs / 1000 / audioSec).toFixed(4)}`);
+log(pass ? "PARITY PASS" : "PARITY FAIL");
+window.__parity = { rows, pass, rtf: synthMs / 1000 / audioSec };
+console.log("PARITY_JSON " + JSON.stringify({ log: document.getElementById("log").textContent, rows, pass }));
+</script>
+</body>
+</html>

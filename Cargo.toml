@@ -1,0 +1,48 @@
+[package]
+name = "ribt"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ribt (Real-time, In-Body Talk): a small streaming English TTS, trained and run in tang's tensor IR"
+license = "MIT"
+repository = "https://github.com/muni-works/ribt"
+homepage = "https://ribt.dev"
+
+# Own workspace, pinned to a tang git rev: tang's tensor IR is not in a registry release yet.
+[workspace]
+
+# Exactly one GPU backend per build (see src/runtime.rs):
+#   macOS:  cargo build --release                       (metal)
+#   Linux:  cargo build --release --no-default-features --features cuda
+#           cargo build --release --no-default-features --features wgpu
+[features]
+default = ["metal"]
+metal = ["dep:metal", "tang-bench/metal"]
+cuda = ["dep:cudarc"]
+wgpu = ["dep:tang-gpu"]
+# CPU (C lowering + system cc at load time), e.g. the K1: --no-default-features --features cpu
+cpu = ["dep:libloading"]
+# OpenCL (to_opencl + dlopen libOpenCL, binary cache), e.g. the K1's Adreno: --no-default-features --features opencl
+opencl = ["dep:libloading"]
+
+[dependencies]
+tang = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12", features = ["std"] }
+tang-expr = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
+tang-compile = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
+# The Metal runtime for IR programs lives in tang-bench (`ir_msl`) for now.
+# Upstreaming task: move it to tang-compute so nothing depends on a bench crate.
+tang-bench = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
+tang-gpu = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12", optional = true }
+metal = { version = "0.33", optional = true }
+# same cudarc as tang-bench's `cuda` feature (dynamic libcuda/libnvrtc)
+cudarc = { version = "0.16", features = ["cuda-12080"], optional = true }
+safetensors = "0.4"
+hound = "3.5"
+anyhow = "1"
+libloading = { version = "0.8", optional = true }
+
+[profile.release]
+debug = 1
+
+[profile.test]
+opt-level = 2

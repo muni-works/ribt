@@ -1,0 +1,3 @@
+# full golden (train split included) is 23 MB; regenerate with
+# ~/.cache/kv/bin/python -I scripts/lilt_golden.py golden
+golden.tsv

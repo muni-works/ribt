@@ -1,0 +1,89 @@
+# context A/B eval (the ribt paper): name, text, prev, role, emph (word idx). Columns 6+ (eval only): set, focus word idx
+table_none	I put it on the table.	-	none	-	focus	-
+table_A	I put it on the table.	Who put it on the table?	answer	-	focus	0
+table_Ahint	I put it on the table.	-	answer	0	focus	0
+table_B	I put it on the table.	Where did you put it?	answer	-	focus	5
+table_Bhint	I put it on the table.	-	answer	5	focus	5
+charger_none	Maya fixed the charger yesterday.	-	none	-	focus	-
+charger_A	Maya fixed the charger yesterday.	Who fixed the charger?	answer	-	focus	0
+charger_Ahint	Maya fixed the charger yesterday.	-	answer	0	focus	0
+charger_B	Maya fixed the charger yesterday.	When did Maya fix the charger?	answer	-	focus	4
+charger_Bhint	Maya fixed the charger yesterday.	-	answer	4	focus	4
+cup_none	The red cup is in the kitchen.	-	none	-	focus	-
+cup_A	The red cup is in the kitchen.	Which cup is in the kitchen?	answer	-	focus	1
+cup_Ahint	The red cup is in the kitchen.	-	answer	1	focus	1
+cup_B	The red cup is in the kitchen.	Where is the red cup?	answer	-	focus	6
+cup_Bhint	The red cup is in the kitchen.	-	answer	6	focus	6
+box_none	I want the blue box.	-	none	-	focus	-
+box_A	I want the blue box.	Do you want the blue bag?	correction	-	focus	4
+box_Ahint	I want the blue box.	-	answer	4	focus	4
+box_B	I want the blue box.	Do you want the red box?	correction	-	focus	3
+box_Bhint	I want the blue box.	-	answer	3	focus	3
+seven_none	We leave at seven tomorrow.	-	none	-	focus	-
+seven_A	We leave at seven tomorrow.	Do we leave at seven tonight?	correction	-	focus	4
+seven_Ahint	We leave at seven tomorrow.	-	answer	4	focus	4
+seven_B	We leave at seven tomorrow.	Do we leave at eight tomorrow?	correction	-	focus	3
+seven_Bhint	We leave at seven tomorrow.	-	answer	3	focus	3
+keys_none	Jordan has the keys.	-	none	-	focus	-
+keys_A	Jordan has the keys.	Who has the keys?	answer	-	focus	0
+keys_Ahint	Jordan has the keys.	-	answer	0	focus	0
+keys_B	Jordan has the keys.	What does Jordan have?	answer	-	focus	3
+keys_Bhint	Jordan has the keys.	-	answer	3	focus	3
+battery_none	The battery is almost empty.	-	none	-	focus	-
+battery_A	The battery is almost empty.	Is the battery almost full?	correction	-	focus	4
+battery_Ahint	The battery is almost empty.	-	answer	4	focus	4
+battery_B	The battery is almost empty.	Is the laptop almost empty?	correction	-	focus	1
+battery_Bhint	The battery is almost empty.	-	answer	1	focus	1
+lights_none	I turned off the lights.	-	none	-	focus	-
+lights_A	I turned off the lights.	Did you turn off the fan?	correction	-	focus	4
+lights_Ahint	I turned off the lights.	-	answer	4	focus	4
+lights_B	I turned off the lights.	Did you turn on the lights?	correction	-	focus	2
+lights_Bhint	I turned off the lights.	-	answer	2	focus	2
+called_none	She called me this morning.	-	none	-	focus	-
+called_A	She called me this morning.	Who called you this morning?	answer	-	focus	0
+called_Ahint	She called me this morning.	-	answer	0	focus	0
+called_B	She called me this morning.	When did she call you?	answer	-	focus	4
+called_Bhint	She called me this morning.	-	answer	4	focus	4
+meeting_none	The meeting moved to Friday.	-	none	-	focus	-
+meeting_A	The meeting moved to Friday.	Did the meeting move to Thursday?	correction	-	focus	4
+meeting_Ahint	The meeting moved to Friday.	-	answer	4	focus	4
+meeting_B	The meeting moved to Friday.	Did the party move to Friday?	correction	-	focus	1
+meeting_Bhint	The meeting moved to Friday.	-	answer	1	focus	1
+shelf_none	It's on the second shelf.	-	none	-	focus	-
+shelf_A	It's on the second shelf.	Is it on the top shelf?	correction	-	focus	3
+shelf_Ahint	It's on the second shelf.	-	answer	3	focus	3
+shelf_B	It's on the second shelf.	Is it in the second drawer?	correction	-	focus	4
+shelf_Bhint	It's on the second shelf.	-	answer	4	focus	4
+dinner_none	Priya made dinner tonight.	-	none	-	focus	-
+dinner_A	Priya made dinner tonight.	Who made dinner tonight?	answer	-	focus	0
+dinner_Ahint	Priya made dinner tonight.	-	answer	0	focus	0
+dinner_B	Priya made dinner tonight.	What did Priya make tonight?	answer	-	focus	2
+dinner_Bhint	Priya made dinner tonight.	-	answer	2	focus	2
+q0_none	Do you want me to grab it?	-	none	-	question	-
+q0_q	Do you want me to grab it?	I think I left it in the kitchen.	question	-	question	-
+q1_none	Is the door locked?	-	none	-	question	-
+q1_q	Is the door locked?	I think I left it in the kitchen.	question	-	question	-
+q2_none	Can you hear me okay?	-	none	-	question	-
+q2_q	Can you hear me okay?	I think I left it in the kitchen.	question	-	question	-
+q3_none	Should I charge the battery now?	-	none	-	question	-
+q3_q	Should I charge the battery now?	I think I left it in the kitchen.	question	-	question	-
+q4_none	Did you see where it went?	-	none	-	question	-
+q4_q	Did you see where it went?	I think I left it in the kitchen.	question	-	question	-
+q5_none	Are you ready to go?	-	none	-	question	-
+q5_q	Are you ready to go?	I think I left it in the kitchen.	question	-	question	-
+q6_none	Is that your phone?	-	none	-	question	-
+q6_q	Is that your phone?	I think I left it in the kitchen.	question	-	question	-
+q7_none	Could you open the window?	-	none	-	question	-
+q7_q	Could you open the window?	I think I left it in the kitchen.	question	-	question	-
+ack0_none	Okay.	-	none	-	ack	-
+ack0_ack	Okay.	Can you grab the charger for me?	ack	-	ack	-
+ack1_none	Got it.	-	none	-	ack	-
+ack1_ack	Got it.	Put the red cup on the shelf.	ack	-	ack	-
+ack2_none	Sure thing.	-	none	-	ack	-
+ack2_ack	Sure thing.	Could you turn off the lights?	ack	-	ack	-
+ack3_none	Sounds good.	-	none	-	ack	-
+ack3_ack	Sounds good.	Let's leave at seven.	ack	-	ack	-
+ack4_none	Yeah, totally.	-	none	-	ack	-
+ack4_ack	Yeah, totally.	That was a long day.	ack	-	ack	-
+ack5_none	Mm-hm.	-	none	-	ack	-
+ack5_ack	Mm-hm.	So I plugged it in and waited.	ack	-	ack	-

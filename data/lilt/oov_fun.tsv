@@ -1,0 +1,83 @@
+# word	expected-ish reading	category	sentence (render + listening set, docs §27)
+zorbing	ZOR-bing	coinage	We went zorbing down the hill.
+fluffernutter	FLUFF-er-nut-er	coinage	She packed a fluffernutter for lunch.
+skibidi	ski-BID-ee	coinage	The kids kept saying skibidi all day.
+rizz	RIZ	coinage	He has a lot of rizz.
+bamboozlement	bam-BOO-zul-ment	coinage	The bamboozlement was complete.
+flibbertigibbet	FLIB-er-tee-JIB-it	coinage	Stop acting like a flibbertigibbet.
+snollygoster	SNOL-ee-gos-ter	coinage	The senator was a snollygoster.
+kerfuffle	ker-FUF-ul	coinage	There was a small kerfuffle at the door.
+discombobulated	dis-kum-BOB-yoo-lay-tid	coinage	I feel discombobulated this morning.
+gobbledygook	GOB-ul-dee-gook	coinage	The manual was pure gobbledygook.
+hullabaloo	HUL-uh-buh-loo	coinage	What is all this hullabaloo about?
+bumbershoot	BUM-ber-shoot	coinage	Grab your bumbershoot, it is raining.
+cattywampus	KAT-ee-wom-pus	coinage	The picture hangs cattywampus.
+lollygag	LOL-ee-gag	coinage	Do not lollygag on the way home.
+brouhaha	BROO-ha-ha	coinage	The brouhaha died down by noon.
+yeet	YEET	coinage	He tried to yeet the ball over the fence.
+Theo	THEE-oh	name	Theo will meet us at the station.
+Olivia	oh-LIV-ee-uh	name	Olivia wrote the first draft.
+Luis	loo-EES	name	Luis brought the coffee.
+Siobhan	shuh-VAWN	name	Siobhan is running late.
+Nguyen	NWIN	name	Doctor Nguyen will see you now.
+Saoirse	SEER-sha	name	Saoirse played the lead.
+Joaquin	wah-KEEN	name	Joaquin fixed the bike.
+Xochitl	SO-cheel	name	Xochitl sent a postcard.
+Kokoro	koh-KOH-roh	name	Kokoro was the teacher model.
+Pedersen	PED-er-sen	name	Cam Pedersen built the robot.
+Hobson	HOB-sun	log	Hobson and Dewey went home.
+Conti	KON-tee	log	The Abbe Conti was there.
+Martelli	mar-TEL-ee	log	Martelli opened the shop.
+Lacheneur	lash-en-UR	log	Lacheneur rode north.
+Servadac	SER-vuh-dak	log	Captain Servadac looked up.
+Wylder	WIL-der	log	Wylder kept the letters.
+gayety	GAY-uh-tee	log	The gayety of the evening faded.
+companionless	kum-PAN-yun-less	log	He walked on, companionless.
+Apaturia	ap-uh-TOOR-ee-uh	log	The feast of Apaturia came in autumn.
+Critias	KRIT-ee-us	log	Critias spoke next.
+Vocos	VOH-kohs	tech	Vocos is a fast vocoder.
+iSTFTNet	eye-S-T-F-T-net	tech	The iSTFTNet decoder runs on the GPU.
+Kubernetes	koo-ber-NET-eez	tech	We deploy it on Kubernetes.
+PyTorch	PIE-torch	tech	The reference code is in PyTorch.
+LLaMA	LAH-muh	tech	LLaMA is a language model.
+Frigate	FRIG-it	tech	Frigate records the garage camera.
+nginx	engine-X	tech	Put nginx in front of the server.
+sudo	SOO-doo	tech	Run it with sudo.
+grep	GREP	tech	Use grep to find the line.
+kubectl	KOOB-control	tech	Check the pods with kubectl.
+GIF	GIF	tech	Send me a GIF of the robot.
+logits	LOH-jits	tech	The logits come out of the last layer.
+softmax	SOFT-max	tech	Apply a softmax to the scores.
+worktree	WURK-tree	tech	Make a new worktree for the branch.
+safetensors	SAFE-ten-sorz	tech	Save the weights as safetensors.
+WavLM	wave-L-M	tech	WavLM scores the speaker likeness.
+talketh	TAWK-eth	archaic	He talketh too much.
+whilst	WYLST	archaic	Wait here whilst I check.
+thou	THOW	archaic	Thou shalt not pass.
+forsooth	for-SOOTH	archaic	Forsooth, the king is dead.
+betwixt	bih-TWIKST	archaic	The cat sat betwixt the dogs.
+doth	DUTH	archaic	The lady doth protest too much.
+servo	SER-voh	robot	The servo is overheating.
+actuator	AK-choo-ay-ter	robot	Replace the knee actuator.
+odometry	oh-DOM-uh-tree	robot	The odometry drifted a meter.
+teleop	TEL-ee-op	robot	Switch the robot to teleop.
+sysid	SIS-id	robot	Run sysid on the ankle.
+IMU	I-M-U	robot	The IMU reads the tilt.
+mujoco	moo-JOH-koh	robot	The policy was trained in mujoco.
+Worcestershire	WUS-ter-sher	place	Add a dash of Worcestershire sauce.
+Llanfair	HLAN-vire	place	We drove through Llanfair.
+Ouagadougou	wah-guh-DOO-goo	place	The flight lands in Ouagadougou.
+Poughkeepsie	puh-KIP-see	place	She grew up in Poughkeepsie.
+Reykjavik	RAKE-yuh-vik	place	It was cold in Reykjavik.
+4:15	four fifteen	time	Meet me at 4:15 by the door.
+8:30	eight thirty	time	The train leaves at 8:30.
+12:00	twelve o'clock	time	Lunch is at 12:00 pm.
+3D	three D	number	We printed a 3D model.
+1990s	nineteen nineties	number	It was popular in the 1990s.
+2nd	second	number	She came in 2nd place.
+v2.1	V two point one	number	Upgrade to v2.1 tonight.
+x86	X eighty-six	number	It only runs on x86.
+B2B	B to B	number	They sell B2B software.
+cam@ipse.dev	cam at ipse dot dev	address	Write to cam@ipse.dev for access.
+https://ribt.dev/docs	ribt dot dev slash docs	address	The docs live at https://ribt.dev/docs today.
+@campedersen	at cam pedersen	address	Follow @campedersen for updates.

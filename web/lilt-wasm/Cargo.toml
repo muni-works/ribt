@@ -1,0 +1,21 @@
+[package]
+name = "lilt-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "lilt G2P (ribt's src/lilt, compiled as is) for the browser"
+
+# own root: not a member of ribt's workspace
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# pinned to the installed wasm-bindgen CLI (build.sh checks)
+wasm-bindgen = "=0.2.108"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

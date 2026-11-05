@@ -1,0 +1,23 @@
+lilt data files: provenance and licences
+
+gold.tsv, silver.tsv
+  misaki 0.9.4 data/us_gold.json and data/us_silver.json (hexgrad), after
+  misaki's own grow_dictionary(), re-serialised as sorted TSV by
+  scripts/lilt_golden.py. misaki is distributed under the Apache License 2.0
+  (Copyright hexgrad); the dictionaries ship inside that package with no
+  separate licence. Upstream does not document their derivation.
+
+tok_rules.tsv
+  spaCy 3.8 English tokenizer special cases (explosion/spaCy, MIT licence,
+  Copyright (C) 2016-2024 ExplosionAI GmbH, 2016 spaCy GmbH, 2015 Matthew
+  Honnibal), exported by scripts/lilt_golden.py.
+
+tagger.bin
+  Averaged-perceptron weights trained by `ribt lilt train-tagger` on
+  spaCy en_core_web_sm 3.8 (MIT) predictions over corpus.txt. No treebank
+  data was used.
+
+corpus.txt, golden_eval.tsv
+  Sentences from WordNet 3.0 glosses/examples (Princeton University, WordNet
+  3.0 licence: free use with copyright notice, "WordNet 3.0 Copyright 2006 by
+  Princeton University. All rights reserved."), and hand-written edge cases; goldens are misaki 0.9.4 output on them.
