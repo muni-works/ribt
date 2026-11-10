@@ -14,7 +14,7 @@
 
 use std::time::Instant;
 
-use tang_compile::tensor::{TensorGraph, TensorId};
+use tang_compile::tensor::{Op, TensorGraph, TensorId};
 
 #[cfg(any(
     all(feature = "metal", feature = "cuda"),
@@ -28,7 +28,25 @@ compile_error!("enable exactly one backend: --no-default-features --features cud
 compile_error!("enable a backend feature: metal, cuda, wgpu, cpu or opencl");
 
 /// The pass pipeline tang's own benches use, then `schedule_auto`.
+///
+/// A graph with scans gets every live scan's inputs appended to its outputs
+/// (after the given ones, so output indices stay as given). At tang
+/// 73a78dcb a scan reads its inputs as buffers in the layout it was built
+/// with, but `relayout` permutes a scan input's dims and the schedule
+/// inlines a map read only by a scan; an output is exempt from both.
 pub fn optimize(g: &TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+    let pinned = g.nodes().iter().any(|n| matches!(n.op, Op::Scan(_))).then(|| {
+        let (g, mut outs) = g.eliminate_dead(outs);
+        for i in 0..g.nodes().len() {
+            for t in g.scan_at(TensorId::from_index(i)).map(|s| s.inputs.clone()).into_iter().flatten() {
+                if !outs.contains(&t) {
+                    outs.push(t);
+                }
+            }
+        }
+        (g, outs)
+    });
+    let (g, outs) = pinned.as_ref().map_or((g, outs), |(g, o)| (g, &o[..]));
     let (g, outs) = g.substitute_maps(outs);
     let (g, outs) = g.eliminate_common(&outs);
     let (g, outs) = g.merge_siblings(&outs);

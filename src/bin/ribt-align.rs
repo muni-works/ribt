@@ -8,6 +8,9 @@
 //!   ribt-align durs  --ckpt F --phon A.phon.tsv[,…] --root LIBRITTS_R --out durs.tsv
 //!                    [--attn-dir DIR --attn-n 8]   (soft attention + path npys for plots)
 //!   ribt-align check [--cfg check]                  one train step, GPU vs f64 interpreter
+//!   ribt-align scancheck [--cfg base] [--batch 12] [--n 192] [--t 1024] [--blank none] [--w-bin 0.5] [--iters 20]
+//!                    in-graph scan losses (GPU, f32) vs the host (f64), then the
+//!                    one-program step vs the two-program step: gradients and time
 //!
 //! `*.phon.tsv` come from `scripts/phonemize_libritts.py` (Kokoro ids); the
 //! split name is the file name before `.phon.tsv`, and utterance
@@ -56,9 +59,10 @@ fn main() -> Result<()> {
         Some("train") => train(&a),
         Some("durs") => durs(&a),
         Some("check") => check(&a),
+        Some("scancheck") => scancheck(&a),
         Some("melcheck") => melcheck(&a),
         _ => {
-            eprintln!("usage: ribt-align train|durs|check (see src/bin/ribt-align.rs)");
+            eprintln!("usage: ribt-align train|durs|check|scancheck (see src/bin/ribt-align.rs)");
             Ok(())
         }
     }
@@ -580,6 +584,193 @@ fn check(a: &Args) -> Result<()> {
     );
     if z_err > 1e-4 || m_err > 1e-3 {
         return Err(anyhow!("GPU/interpreter mismatch"));
+    }
+    Ok(())
+}
+
+/// The scan path ([`align::scan_loss`]) on the GPU against the host path on
+/// synthetic batches of the training shape with per-item lengths:
+/// 1. losses, MAS durations and `∂L/∂z` on logits fed as data, for the
+///    network's own logits at init and for sharp ones (a trained aligner's);
+/// 2. the gradients of the one-program step ([`align::scan_train_graph`])
+///    against the two-program step's ([`align::train_graph`] fed host `G`);
+/// 3. wall time per step of both, as `train` runs them.
+fn scancheck(a: &Args) -> Result<()> {
+    let ac = a.cfg()?;
+    let specs = ac.params();
+    let np = specs.len();
+    let (bsz, nmax, tmax): (usize, usize, usize) = (a.get("--batch", 12), a.get("--n", 192), a.get("--t", 1024));
+    let (iters, w_bin, blank) = (a.get("--iters", 20usize), a.get("--w-bin", 0.5f64), a.blank());
+    let mut rng = Rng::new(a.get("--seed", 4));
+    // item 0 fills the padded shape; the rest: 1/3..1 of the frames, 5..8 frames per token
+    let ls: Vec<(usize, usize)> = (0..bsz)
+        .map(|b| {
+            if b == 0 {
+                return (nmax, tmax);
+            }
+            let t = tmax / 3 + rng.below(tmax - tmax / 3 + 1);
+            let n = ((t as f64 / (5.0 + 3.0 * rng.uniform())) as usize).clamp(1, nmax.min(t));
+            (n, t)
+        })
+        .collect();
+    let params = align::init_params(&ac, 1);
+    let toks: Vec<Vec<u16>> = ls.iter().map(|&(n, _)| (0..n).map(|_| rng.below(ac.vocab) as u16).collect()).collect();
+    let rows: Vec<&[u16]> = toks.iter().map(|r| r.as_slice()).collect();
+    let oh = align::onehot(&rows, ac.vocab, nmax);
+    let mel: Vec<f32> = (0..bsz * ac.n_mels * tmax).map(|_| (ac.mel_mu + ac.mel_sd * rng.normal()) as f32).collect();
+    let (prior, end, fw) = align::scan_data(&ls, nmax, tmax, 1.0);
+    let dev = Device::new();
+    eprintln!("{} ({}), B{bsz} N{nmax} T{tmax}, blank {blank:?}, w_bin {w_bin}, lens {ls:?}", ribt::runtime::BACKEND, dev.name());
+
+    // 1. the losses on given logits
+    let ag = align::align_graph(&ac, bsz, nmax, tmax);
+    let mut fwd = Program::new(&dev, &ag.b.g, &[ag.z], &refs(&align::assemble(&ag.b, &specs, &params, None, &[("onehot", &oh), ("mel", &mel)])));
+    fwd.run(&dev);
+    let z_init = fwd.read(&dev, 0);
+    // sharp logits: a random monotonic path per item, −4 per token of distance, unit noise
+    let mut z_sharp = vec![0.0f32; bsz * nmax * tmax];
+    for (b, &(n, t)) in ls.iter().enumerate() {
+        let mut cuts: Vec<usize> = (0..n - 1).map(|_| 1 + rng.below(t - 1)).collect();
+        cuts.sort();
+        for ni in 0..nmax {
+            for ti in 0..tmax {
+                let on = cuts.iter().filter(|&&c| c <= ti).count() as f64;
+                z_sharp[(b * nmax + ni) * tmax + ti] = (-4.0 * (ni as f64 - on).abs() + rng.normal()) as f32;
+            }
+        }
+    }
+    let mut zb = model::Built::new_pub(&Config::tiny());
+    let z = zb.input(&[bsz, nmax, tmax], model::Role::Data("z"));
+    let sl = align::scan_loss(&mut zb, z, blank);
+    let gz = zb.g.backward(sl.total, &[z]).unwrap()[0];
+    let wb = [w_bin as f32];
+    let zin = align::assemble(&zb, &[], &[], None, &[("z", &z_init), ("prior", &prior), ("end", &end), ("fw", &fw), ("w_bin", &wb)]);
+    let mut zprog = Program::new(&dev, &zb.g, &[sl.loss_fs, sl.loss_bin, sl.sharp, sl.dur, gz], &refs(&zin));
+    eprintln!("loss-only program: {} kernels, compile {:.0} ms", zprog.kernels(), zprog.compile_ms);
+    let k_z = zb.input_index(z);
+    let (mut ok, mut paths_agree) = (true, true);
+    for (name, zv) in [("init", &z_init), ("sharp", &z_sharp)] {
+        zprog.write_input(&dev, k_z, zv);
+        zprog.run(&dev);
+        let (g, lf, lb, sp, durs) = align::batch_host(zv, nmax, tmax, &ls, w_bin, 1.0, blank);
+        let (glf, glb, gsp, gdur, gg) = (zprog.read(&dev, 0)[0] as f64, zprog.read(&dev, 1)[0] as f64, zprog.read(&dev, 2)[0] as f64, zprog.read(&dev, 3), zprog.read(&dev, 4));
+        let (mut tok_off, mut frames_off, mut toks_n) = (0usize, 0.0f64, 0usize);
+        for (b, d) in durs.iter().enumerate() {
+            for (ni, &want) in d.iter().enumerate() {
+                let got = gdur[b * nmax + ni] as f64;
+                toks_n += 1;
+                if got != want as f64 {
+                    tok_off += 1;
+                    frames_off += (got - want as f64).abs();
+                }
+            }
+        }
+        let scale = g.iter().fold(0.0f32, |m, v| m.max(v.abs())) as f64;
+        let max_abs = gg.iter().zip(&g).fold(0.0f64, |m, (a, h)| m.max((*a as f64 - *h as f64).abs()));
+        let (num, den) = gg.iter().zip(&g).fold((0.0f64, 0.0f64), |(n, d), (a, h)| (n + (*a as f64 - *h as f64).powi(2), d + (*h as f64).powi(2)));
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-12);
+        eprintln!(
+            "z {name}: L_fs {glf:.6} vs host {lf:.6} (rel {:.1e}), L_bin {glb:.6} vs {lb:.6} (rel {:.1e}), sharp {gsp:.4} vs {sp:.4}\n  durations: {tok_off}/{toks_n} tokens differ ({frames_off} frames moved)\n  dL/dz: rel l2 {:.2e}, max abs {max_abs:.2e} / max |G| {scale:.2e} = {:.2e}, non-finite {}",
+            rel(glf, lf),
+            rel(glb, lb),
+            (num / den).sqrt(),
+            max_abs / scale,
+            gg.iter().filter(|v| !v.is_finite()).count()
+        );
+        // a moved MAS frame moves w_bin/(B·t) of gradient: hold dL/dz to the host's only where the paths agree
+        ok &= rel(glf, lf) < 1e-4 && gg.iter().all(|v| v.is_finite()) && (tok_off > 0 || (num / den).sqrt() < 1e-3);
+        paths_agree &= tok_off == 0;
+    }
+    drop(zprog);
+
+    // 2. one step both ways from the same state; m' = (1−β₁)·clipped grad
+    let hyper = [1e-3f32, 0.1, 0.001, 0.0, 1.0, 0.0];
+    let tg = align::train_graph(&ac, bsz, nmax, tmax);
+    let mut inp = align::assemble(&tg.ag.b, &specs, &params, None, &[("onehot", &oh), ("mel", &mel)]);
+    inp[tg.ag.b.input_index(tg.hyper)] = hyper.to_vec();
+    let mut two = Program::new(&dev, &tg.ag.b.g, &tg.outputs, &refs(&inp));
+    let st = align::scan_train_graph(&ac, bsz, nmax, tmax, blank);
+    let mut inp = align::assemble(&st.ag.b, &specs, &params, None, &[("onehot", &oh), ("mel", &mel), ("prior", &prior), ("end", &end), ("fw", &fw), ("w_bin", &wb)]);
+    inp[st.ag.b.input_index(st.hyper)] = hyper.to_vec();
+    let mut one = Program::new(&dev, &st.ag.b.g, &st.outputs, &refs(&inp));
+    drop(inp);
+    eprintln!("two-program step: fwd {} + train {} kernels (compile {:.0} ms); one-program step: {} kernels (compile {:.0} ms)", fwd.kernels(), two.kernels(), two.compile_ms, one.kernels(), one.compile_ms);
+    let k_gz = tg.ag.b.input_index(tg.gz);
+    let (gzv, lf, lb, _, _) = align::batch_host(&z_init, nmax, tmax, &ls, w_bin, 1.0, blank);
+    two.write_input(&dev, k_gz, &gzv);
+    two.run(&dev);
+    one.run(&dev);
+    let (mut num, mut den, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..np {
+        let (a, b) = (one.read(&dev, 1 + np + i), two.read(&dev, 1 + np + i));
+        let sc = b.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-20) as f64;
+        for (x, y) in a.iter().zip(&b) {
+            num += (*x as f64 - *y as f64).powi(2);
+            den += (*y as f64).powi(2);
+            worst = worst.max((*x as f64 - *y as f64).abs() / sc);
+        }
+    }
+    let (gn1, gn2) = (one.read(&dev, 0)[0], two.read(&dev, 0)[0]);
+    eprintln!(
+        "step at init: grad norm {gn1} (one) vs {gn2} (two); grads rel l2 {:.2e}, worst per-tensor max-abs/scale {worst:.2e}; L_fs {} vs host {lf}, L_bin {} vs {lb}",
+        (num / den).sqrt(),
+        one.read(&dev, 1 + 3 * np)[0],
+        one.read(&dev, 2 + 3 * np)[0]
+    );
+    ok &= !paths_agree || w_bin == 0.0 || (num / den).sqrt() < 1e-3;
+    ok &= w_bin != 0.0 || (num / den).sqrt() < 1e-3;
+
+    // 3. wall time per step, as `train` runs each (no frontend, no optimizer swap)
+    let (k_mel2, k_oh2) = (tg.ag.b.input_index(tg.ag.mel), tg.ag.b.input_index(tg.ag.onehot));
+    let (k_melf, k_ohf) = (ag.b.input_index(ag.mel), ag.b.input_index(ag.onehot));
+    let k_p2: Vec<usize> = tg.ag.params.iter().map(|&t| tg.ag.b.input_index(t)).collect();
+    let k_pf: Vec<usize> = ag.params.iter().map(|&t| ag.b.input_index(t)).collect();
+    let b1 = &st.ag.b;
+    let (k_mel1, k_oh1) = (b1.input_index(st.ag.mel), b1.input_index(st.ag.onehot));
+    let k_d: Vec<usize> = [st.sl.prior, st.sl.end, st.sl.fw, st.sl.w_bin].iter().map(|&t| b1.input_index(t)).collect();
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (mut t_two, mut t_host, mut t_one) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..iters + 2 {
+        let ts = Instant::now();
+        fwd.write_input(&dev, k_melf, &mel);
+        fwd.write_input(&dev, k_ohf, &align::onehot(&rows, ac.vocab, nmax));
+        fwd.run(&dev);
+        let z = fwd.read(&dev, 0);
+        let th = Instant::now();
+        let (gzv, ..) = align::batch_host(&z, nmax, tmax, &ls, w_bin, 1.0, blank);
+        t_host.push(th.elapsed().as_secs_f64() * 1e3);
+        two.write_input(&dev, k_mel2, &mel);
+        two.write_input(&dev, k_oh2, &align::onehot(&rows, ac.vocab, nmax));
+        two.write_input(&dev, k_gz, &gzv);
+        two.run(&dev);
+        let _ = two.read(&dev, 0)[0];
+        // the param copy into `fwd` (train swaps p ↔ p' first; the copy is the same size)
+        for (kf, k2) in k_pf.iter().zip(&k_p2) {
+            fwd.write_input(&dev, *kf, &two.read_input(&dev, *k2).unwrap());
+        }
+        t_two.push(ts.elapsed().as_secs_f64() * 1e3);
+
+        let ts = Instant::now();
+        let (prior, end, fw) = align::scan_data(&ls, nmax, tmax, 1.0);
+        one.write_input(&dev, k_mel1, &mel);
+        one.write_input(&dev, k_oh1, &align::onehot(&rows, ac.vocab, nmax));
+        for (k, v) in k_d.iter().zip([&prior[..], &end[..], &fw[..], &wb[..]]) {
+            one.write_input(&dev, *k, v);
+        }
+        one.run(&dev);
+        let _ = (one.read(&dev, 0)[0], one.read(&dev, 1 + 3 * np)[0], one.read(&dev, 2 + 3 * np)[0], one.read(&dev, 3 + 3 * np)[0]);
+        t_one.push(ts.elapsed().as_secs_f64() * 1e3);
+    }
+    let (t_two, t_host, t_one) = (med(t_two.split_off(2)), med(t_host.split_off(2)), med(t_one.split_off(2)));
+    let (k_fwd, k_two, k_one) = (fwd.time(&dev, iters), two.time(&dev, iters), one.time(&dev, iters));
+    eprintln!(
+        "step time, median of {iters}: two-program {t_two:.1} ms (host forward-sum/MAS {t_host:.1} ms of it; kernels only: fwd {k_fwd:.1} + train {k_two:.1} ms), one-program {t_one:.1} ms (kernels only {k_one:.1} ms)"
+    );
+    if !ok {
+        return Err(anyhow!("scan path disagrees with the host"));
     }
     Ok(())
 }

@@ -13,12 +13,20 @@
 //! its derived backward is exactly `∂L/∂θ` (G is constant w.r.t. θ).
 //! Two programs per step: `fwd` (z only) and `train` (z, surrogate,
 //! backward, AdamW); after each step the new params are copied into `fwd`.
+//!
+//! **The scan path.** tang now has semiring scans, so [`scan_loss`] writes
+//! the same losses in the graph: the log-softmax, the forward-sum as a
+//! banded log-semiring scan over frames (bands stay / advance), MAS as the
+//! same scan in max-plus (its gradient w.r.t. the log attention is the
+//! one-hot path), and both losses, with the backward derived.
+//! [`scan_train_graph`] is then one program per step. The host path stays
+//! the reference and the training default.
 
 use tang::Scalar;
-use tang_compile::tensor::{Monoid, TensorId};
+use tang_compile::tensor::{Monoid, Semiring, TensorGraph, TensorId, View};
 use tang_expr::ExprId;
 
-use crate::ir::{self, arg, lit, pick};
+use crate::ir::{self, arg, form, lit, pick, view};
 use crate::model::{self, Built, Config, ParamSpec, Role};
 
 /// Kokoro's token count (misaki phoneme chars + punctuation, pad id 0).
@@ -191,6 +199,221 @@ pub fn train_graph(ac: &AConfig, batch: usize, n: usize, t: usize) -> AlignTrain
     outputs.extend(&ad.new_v);
     outputs.extend(ad.partials);
     AlignTrain { ag, gz, m, v, hyper, surrogate, grads, outputs }
+}
+
+/// The losses of [`batch_host`] written in the graph over distance logits
+/// `z [B, N, T]`. Per-item lengths come in as data, built by
+/// [`scan_data`]: "prior" `[B, N, T]` (log prior, [`Semiring::NEG`] on
+/// tokens `≥ n_b`), "end" `[B, N, T]` (1 at `(n_b − 1, t_b − 1)`), "fw"
+/// `[B, 1, T]` (`1/(B·t_b)` on frames `< t_b`, else 0) and "w_bin" `[1]`.
+pub struct ScanLoss {
+    pub prior: TensorId,
+    pub end: TensorId,
+    pub fw: TensorId,
+    pub w_bin: TensorId,
+    /// batch means, `[1]` each, as [`batch_host`] returns them
+    pub loss_fs: TensorId,
+    pub loss_bin: TensorId,
+    pub sharp: TensorId,
+    /// MAS path as a one-hot `[B, N, T]` (detached) and its run lengths `[B, N]`
+    pub hard: TensorId,
+    pub dur: TensorId,
+    /// `loss_fs + w_bin·loss_bin`
+    pub total: TensorId,
+}
+
+/// `log_softmax` over the token axis of `x [B, N, T]`, with an optional
+/// extra class of fixed logit `extra`: `(x − lse, Σ exp(x − max), lse)`,
+/// the last two `[B, 1, T]`. The max is detached (the result does not
+/// depend on it), so no max-reduction backward is derived.
+fn log_softmax_n(g: &mut TensorGraph, x: TensorId, extra: Option<f64>) -> (TensorId, TensorId, TensorId) {
+    let [bs, n, t] = ir::dims(g, x)[..] else { panic!() };
+    let over_n = pick(4, &[Some(0), Some(3), Some(2)]);
+    let per_frame = pick(3, &[Some(0), None, Some(2)]);
+    let mut m = g.comp(&[bs, 1, t], &[n], vec![arg(x, over_n.clone())], Some(Monoid::max()), |v| vec![v[0]]).unwrap();
+    if let Some(e) = extra {
+        m = g.map(&[m], |v| ExprId::select(v[0] - lit(e), v[0], lit(e))).unwrap();
+    }
+    let m = g.detach(m).unwrap();
+    let mut l = g
+        .comp(&[bs, 1, t], &[n], vec![arg(x, over_n), arg(m, pick(4, &[Some(0), None, Some(2)]))], Some(Monoid::sum()), |v| vec![(v[0] - v[1]).exp()])
+        .unwrap();
+    if let Some(e) = extra {
+        l = g.map(&[l, m], |v| v[0] + (lit(e) - v[1]).exp()).unwrap();
+    }
+    let lse = g.map(&[m, l], |v| v[0] + v[1].ln()).unwrap();
+    let lp = g.comp(&[bs, n, t], &[], vec![arg(x, View::identity(3, 3)), arg(lse, per_frame)], None, |v| vec![v[0] - v[1]]).unwrap();
+    (lp, l, lse)
+}
+
+/// Forward-sum and MAS as banded scans along frames with the token axis as
+/// the state: `S_t[i] = lp[t,i] ⊗ (S_{t−1}[i−1] ⊕ S_{t−1}[i])`, started by
+/// `U_0[0] = lp[0,0]`. In the log semiring `S[t_b−1, n_b−1]` is `log Z`; in
+/// max-plus it is the best path's score, whose gradient w.r.t. `lp` is that
+/// path (MAS). A padded item reads its own end cell: the lattice only moves
+/// up in tokens and forward in frames, so cells past `(n_b, t_b)` never
+/// reach it, and padded tokens are excluded from the softmax by the prior.
+///
+/// With `blank` the forward-sum is [`forward_sum_ctc`]'s instead: states
+/// `∅ t₀ ∅ t₁ … ∅` (`e = 2i + 1` is token `i`), bands `[-2, -1, 0]` with
+/// the skip only into a token, `log Z = S[2n_b − 1] ⊕ S[2n_b]` at the last
+/// frame. MAS and the binarization term stay on the blank-free lattice, as
+/// on the host.
+///
+/// MAS ties go to the advance (tang's max-plus rule: smallest predecessor
+/// index), where the host's [`mas`] stays.
+pub fn scan_loss(b: &mut Built, z: TensorId, blank: Option<f64>) -> ScanLoss {
+    let [bs, n, t] = ir::dims(&b.g, z)[..] else { panic!() };
+    let neg = Semiring::NEG;
+    let prior = b.input(&[bs, n, t], Role::Data("prior"));
+    let end = b.input(&[bs, n, t], Role::Data("end"));
+    let fw = b.input(&[bs, 1, t], Role::Data("fw"));
+    let w_bin = b.input(&[1], Role::Data("w_bin"));
+    // 1 where a path starts: (frame 0, token 0); CTC: (frame 0, states 0 and 1)
+    let mut first = vec![0.0; t * n];
+    first[0] = 1.0;
+    let first = b.constant(&[t, n], first);
+    let ne = 2 * n + 2;
+    let ctc = blank.map(|_| {
+        let mut first = vec![0.0; t * ne];
+        first[0] = 1.0;
+        first[1] = 1.0;
+        // the skip band (k = 0, from e − 2) only enters a token state e ≥ 3
+        let skip: Vec<f64> = (0..ne * 3).map(|i| if i % 3 == 0 && ((i / 3) % 2 == 0 || i / 3 < 3) { neg } else { 0.0 }).collect();
+        // state 2n + 1 has no token: it pads the states to an even count
+        let mut phantom = vec![0.0; n + 1];
+        phantom[n] = neg;
+        (b.constant(&[t, ne], first), b.constant(&[ne, 3], skip), b.constant(&[n + 1], phantom), b.constant(&[2], vec![0.0, 1.0]))
+    });
+    let g = &mut b.g;
+    // lp = log_softmax_n(z + prior)
+    let x = g.map(&[z, prior], |v| v[0] + v[1]).unwrap();
+    let (lp, l, _) = log_softmax_n(g, x, None);
+    // lattice in scan layout [B, T, N, ·]: both bands carry the emission
+    let lat = pick(4, &[Some(0), Some(2), Some(1)]);
+    let a = g.comp(&[bs, t, n, 2], &[], vec![arg(lp, lat.clone())], None, |v| vec![v[0]]).unwrap();
+    let u = g
+        .comp(&[bs, t, n, 1], &[], vec![arg(lp, lat.clone()), arg(first, pick(4, &[Some(1), Some(2)]))], None, |v| vec![ExprId::select(v[1] - lit(0.5), v[0], lit(neg))])
+        .unwrap();
+    let bands = [-1, 0];
+    let best = g.semiring_scan_banded(a, u, &bands, 1, false, Semiring::MaxPlus).unwrap();
+    // Σ over the end cells of f(S[t, i], S′, fw); space (one, b, i, t)
+    let end_v = pick(4, &[Some(1), Some(2), Some(3)]);
+    let fw_v = pick(4, &[Some(1), None, Some(3)]);
+    let loss_fs = match (blank, ctc) {
+        (Some(bl), Some((first, skip, phantom, cls))) => {
+            // q = softmax over [blank, log_softmax_n(z) + prior]; padded tokens masked out of both
+            let zm = g.map(&[z, prior], |v| ExprId::select(v[1] - lit(neg / 10.0), v[0], lit(neg))).unwrap();
+            let (lz, _, _) = log_softmax_n(g, zm, None);
+            let x = g.map(&[lz, prior], |v| v[0] + v[1]).unwrap();
+            let (lq, _, all) = log_softmax_n(g, x, Some(bl));
+            // em[b, t, 2i + c] = c = 0: blank, c = 1: token i; via [B, T, N+1, 2]
+            let tok = view(vec![form(4, &[(0, 1)], 0), form(4, &[(2, 1)], 0), form(4, &[(1, 1)], 0)], true);
+            let em = g
+                .comp(
+                    &[bs, t, n + 1, 2],
+                    &[],
+                    vec![arg(lq, tok), arg(all, pick(4, &[Some(0), None, Some(1)])), arg(phantom, pick(4, &[Some(2)])), arg(cls, pick(4, &[Some(3)]))],
+                    None,
+                    move |v| vec![ExprId::select(v[3] - lit(0.5), v[0] + v[2], lit(bl) - v[1])],
+                )
+                .unwrap();
+            let em = g.reshape(em, &[bs, t, ne]).unwrap();
+            let id3 = pick(4, &[Some(0), Some(1), Some(2)]);
+            let a = g.comp(&[bs, t, ne, 3], &[], vec![arg(em, id3.clone()), arg(skip, pick(4, &[Some(2), Some(3)]))], None, |v| vec![v[0] + v[1]]).unwrap();
+            let u = g
+                .comp(&[bs, t, ne, 1], &[], vec![arg(em, id3), arg(first, pick(4, &[Some(1), Some(2)]))], None, |v| vec![ExprId::select(v[1] - lit(0.5), v[0], lit(neg))])
+                .unwrap();
+            let fwd = g.semiring_scan_banded(a, u, &[-2, -1, 0], 1, false, Semiring::Log).unwrap();
+            // log Z = S[2i + 1] ⊕ S[2i + 2] at the end cell (i = n_b − 1)
+            let st = |o: i64| view(vec![form(4, &[(1, 1)], 0), form(4, &[(3, 1)], 0), form(4, &[(2, 2)], o), form(4, &[], 0)], false);
+            g.comp(&[1], &[bs, n, t], vec![arg(fwd, st(1)), arg(fwd, st(2)), arg(end, end_v.clone()), arg(fw, fw_v.clone())], Some(Monoid::sum()), |v| {
+                let m = ExprId::select(v[0] - v[1], v[0], v[1]);
+                let lz = m + ((v[0] - m).exp() + (v[1] - m).exp()).ln();
+                vec![ExprId::select(v[2] - lit(0.5), -(lz * v[3]), ExprId::ZERO)]
+            })
+            .unwrap()
+        }
+        _ => {
+            let fwd = g.semiring_scan_banded(a, u, &bands, 1, false, Semiring::Log).unwrap();
+            g.comp(&[1], &[bs, n, t], vec![arg(fwd, pick(4, &[Some(1), Some(3), Some(2), None])), arg(end, end_v.clone()), arg(fw, fw_v.clone())], Some(Monoid::sum()), |v| {
+                vec![ExprId::select(v[1] - lit(0.5), -(v[0] * v[2]), ExprId::ZERO)]
+            })
+            .unwrap()
+        }
+    };
+    let score = g
+        .comp(&[1], &[bs, n, t], vec![arg(best, pick(4, &[Some(1), Some(3), Some(2), None])), arg(end, end_v)], Some(Monoid::sum()), |v| vec![ExprId::select(v[1] - lit(0.5), v[0], ExprId::ZERO)])
+        .unwrap();
+    let hard = g.backward(score, &[lp]).unwrap()[0];
+    let hard = g.detach(hard).unwrap();
+    let on_path = |g: &mut TensorGraph, out: &[usize], red: &[usize], f: fn(&[ExprId]) -> ExprId| {
+        // space (out…, red…) = (one, b, i, t) or (b, i, t)
+        let r = out.len() + red.len();
+        let d = |k: usize| Some(r - 3 + k);
+        g.comp(out, red, vec![arg(hard, pick(r, &[d(0), d(1), d(2)])), arg(lp, pick(r, &[d(0), d(1), d(2)])), arg(fw, pick(r, &[d(0), None, d(2)]))], Some(Monoid::sum()), move |v| vec![f(v)])
+            .unwrap()
+    };
+    let loss_bin = on_path(g, &[1], &[bs, n, t], |v| ExprId::select(v[0] - lit(0.5), -(v[1] * v[2]), ExprId::ZERO));
+    let dur = on_path(g, &[bs, n], &[t], |v| v[0]);
+    // max_n A = exp(max − lse) = 1/l
+    let sharp = g
+        .comp(&[1], &[bs, t], vec![arg(l, pick(3, &[Some(1), None, Some(2)])), arg(fw, pick(3, &[Some(1), None, Some(2)]))], Some(Monoid::sum()), |v| vec![v[1] / v[0]])
+        .unwrap();
+    let total = g.map(&[loss_fs, loss_bin, w_bin], |v| v[0] + v[2] * v[1]).unwrap();
+    ScanLoss { prior, end, fw, w_bin, loss_fs, loss_bin, sharp, hard, dur, total }
+}
+
+/// Host data for [`scan_loss`]: `(prior, end, fw)` for a padded batch.
+pub fn scan_data(lens: &[(usize, usize)], nmax: usize, tmax: usize, prior_scaling: f64) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let bsz = lens.len();
+    let mut prior = vec![0.0f32; bsz * nmax * tmax];
+    let mut end = vec![0.0f32; bsz * nmax * tmax];
+    let mut fw = vec![0.0f32; bsz * tmax];
+    for (b, &(n, t)) in lens.iter().enumerate() {
+        assert!(t >= n && n > 0 && n <= nmax && t <= tmax, "need tokens ≤ frames within the padded shape ({n}, {t})");
+        let lp = log_prior(n, t, prior_scaling);
+        for ni in 0..nmax {
+            for ti in 0..tmax {
+                prior[(b * nmax + ni) * tmax + ti] = if ni >= n { Semiring::NEG as f32 } else if ti < t { lp[ti * n + ni] as f32 } else { 0.0 };
+            }
+        }
+        end[(b * nmax + n - 1) * tmax + t - 1] = 1.0;
+        fw[b * tmax..b * tmax + t].fill((1.0 / (bsz * t) as f64) as f32);
+    }
+    (prior, end, fw)
+}
+
+/// One training step in one program: [`align_graph`] + [`scan_loss`] +
+/// derived backward + global-norm clip + AdamW. `blank` as in [`utt_host`].
+pub struct AlignScanTrain {
+    pub ag: AlignGraph,
+    pub sl: ScanLoss,
+    pub m: Vec<TensorId>,
+    pub v: Vec<TensorId>,
+    pub hyper: TensorId,
+    pub grads: Vec<TensorId>,
+    /// `[grad_norm, p'…, m'…, v'…, loss_fs, loss_bin, sharp, dur, partials…]`
+    pub outputs: Vec<TensorId>,
+}
+
+pub fn scan_train_graph(ac: &AConfig, batch: usize, n: usize, t: usize, blank: Option<f64>) -> AlignScanTrain {
+    let mut ag = align_graph(ac, batch, n, t);
+    let specs = ac.params();
+    let sl = scan_loss(&mut ag.b, ag.z, blank);
+    let m: Vec<TensorId> = specs.iter().enumerate().map(|(i, s)| ag.b.input(&s.shape, Role::AdamM(i))).collect();
+    let v: Vec<TensorId> = specs.iter().enumerate().map(|(i, s)| ag.b.input(&s.shape, Role::AdamV(i))).collect();
+    let hyper = ag.b.input(&[6], Role::Hyper);
+    let g = &mut ag.b.g;
+    let grads = g.backward(sl.total, &ag.params).unwrap();
+    let ad = model::adamw_betas(g, &specs, &ag.params, &grads, &m, &v, hyper, 0.9, 0.999);
+    let mut outputs = vec![ad.grad_norm];
+    outputs.extend(&ad.new_p);
+    outputs.extend(&ad.new_m);
+    outputs.extend(&ad.new_v);
+    outputs.extend([sl.loss_fs, sl.loss_bin, sl.sharp, sl.dur]);
+    outputs.extend(ad.partials);
+    AlignScanTrain { ag, sl, m, v, hyper, grads, outputs }
 }
 
 /// One vector per graph input of `b`, in input order (aligner params).
