@@ -17,7 +17,7 @@ homepage = "https://ribt.dev"
 #           cargo build --release --no-default-features --features wgpu
 [features]
 default = ["metal"]
-metal = ["dep:metal", "tang-bench/metal"]
+metal = ["dep:metal"]
 cuda = ["dep:cudarc"]
 wgpu = ["dep:tang-gpu"]
 # CPU (C lowering + system cc at load time), e.g. the K1: --no-default-features --features cpu
@@ -26,13 +26,14 @@ cpu = ["dep:libloading"]
 opencl = ["dep:libloading"]
 
 [dependencies]
-tang = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12", features = ["std"] }
-tang-expr = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
-tang-compile = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
-# The Metal runtime for IR programs lives in tang-bench (`ir_msl`) for now.
+tang = { git = "https://github.com/ecto/tang", rev = "73a78dcb111517b6a241dbfcff2fd96400ec23a7", features = ["std"] }
+tang-expr = { git = "https://github.com/ecto/tang", rev = "73a78dcb111517b6a241dbfcff2fd96400ec23a7" }
+tang-compile = { git = "https://github.com/ecto/tang", rev = "73a78dcb111517b6a241dbfcff2fd96400ec23a7" }
+# The Metal runtime for IR programs lives in tang-bench (`ir_msl`); it does not
+# build at this rev, so src/tang_msl.rs is a copy. tang-bench stays for `ir_gpu` (wgpu).
 # Upstreaming task: move it to tang-compute so nothing depends on a bench crate.
-tang-bench = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
-tang-gpu = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12", optional = true }
+tang-bench = { git = "https://github.com/ecto/tang", rev = "73a78dcb111517b6a241dbfcff2fd96400ec23a7" }
+tang-gpu = { git = "https://github.com/ecto/tang", rev = "73a78dcb111517b6a241dbfcff2fd96400ec23a7", optional = true }
 metal = { version = "0.33", optional = true }
 # same cudarc as tang-bench's `cuda` feature (dynamic libcuda/libnvrtc)
 cudarc = { version = "0.16", features = ["cuda-12080"], optional = true }

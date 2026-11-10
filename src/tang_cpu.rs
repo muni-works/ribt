@@ -218,6 +218,7 @@ impl CpuProgram {
                         *o = precision::bf16_bits(x as f64);
                     }
                 }
+                f => unimplemented!("cpu: writing a {f:?} buffer"),
             }
         }
     }
@@ -244,6 +245,7 @@ impl CpuProgram {
                 Format::F32 => std::slice::from_raw_parts(p as *const f32, b.len).to_vec(),
                 Format::F16 => std::slice::from_raw_parts(p as *const u16, b.len).iter().map(|h| precision::f16_from_bits(*h) as f32).collect(),
                 Format::BF16 => std::slice::from_raw_parts(p as *const u16, b.len).iter().map(|h| f32::from_bits((*h as u32) << 16)).collect(),
+                f => unimplemented!("cpu: reading a {f:?} buffer"),
             }
         }
     }

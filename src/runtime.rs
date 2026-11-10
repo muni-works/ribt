@@ -3,7 +3,8 @@
 //! optimizer returns.
 //!
 //! One backend per build, chosen by cargo feature:
-//! - `metal` (default): MSL via tang-bench's `ir_msl` runtime (macOS).
+//! - `metal` (default): MSL via tang-bench's `ir_msl` runtime, vendored in
+//!   `tang_msl` (macOS).
 //! - `cuda`: `TensorGraph::to_cuda` (wmma TF32 tiles + WGSL→CUDA transpiled
 //!   kernels) on a small cudarc runtime here. tang-bench's `ir_cuda` keeps
 //!   its buffers private (no input write / swap), so it is not reused.
@@ -56,7 +57,8 @@ pub const BACKEND: &str = if cfg!(feature = "metal") {
 
 #[cfg(feature = "metal")]
 mod backend {
-    use tang_bench::ir_msl::{Executable, MslDevice};
+    use crate::tang_msl::{Executable, MslDevice};
+    use tang_compile::tensor::msl::FragmentTarget;
     use tang_compile::tensor::{precision, Format, TensorGraph, TensorId};
 
     pub struct Device(pub MslDevice);
@@ -74,7 +76,10 @@ mod backend {
 
     impl Exe {
         pub fn new(dev: &Device, graph: &TensorGraph, outs: &[TensorId], inputs: &[&[f32]]) -> Self {
-            Exe(Executable::new(&dev.0, graph.to_msl(outs), inputs))
+            // no nested contractions: at tang 73a78dcb a contraction nested in a
+            // tile is staged outside its own reduce loop (undeclared `q1_0` in
+            // the vocoder train step's MSL)
+            Exe(Executable::new(&dev.0, graph.to_msl_with(outs, &FragmentTarget::APPLE, false), inputs))
         }
         pub fn kernels(&self) -> usize {
             self.0.program.kernels.len()
@@ -109,6 +114,7 @@ mod backend {
                             *o = precision::bf16_bits(x as f64);
                         }
                     }
+                    f => unimplemented!("metal: writing a {f:?} buffer"),
                 }
             }
         }

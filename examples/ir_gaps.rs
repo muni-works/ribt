@@ -40,7 +40,7 @@ fn main() {
                 let mut f = Form::zero(2);
                 f.coefs = vec![hop as i64, 1];
                 let u = g
-                    .comp(&[frames, nfft], &[], vec![Arg { src: x, view: View { forms: vec![f], guard } }], None, |v| vec![v[0] * v[0]])
+                    .comp(&[frames, nfft], &[], vec![Arg { src: x, view: View { forms: vec![f], guard, gather: None } }], None, |v| vec![v[0] * v[0]])
                     .unwrap();
                 let s = g.reduce(u, 1, tang_compile::tensor::Monoid::sum()).unwrap();
                 let s = g.reduce(s, 0, tang_compile::tensor::Monoid::sum()).unwrap();
@@ -120,7 +120,7 @@ fn main() {
             let mut f = Form::zero(3);
             f.coefs = vec![0, 1, 0];
             f.offset = -1;
-            let v = View { forms: vec![Form { coefs: vec![1, 0, 0], offset: 0 }, f, Form { coefs: vec![0, 0, 1], offset: 0 }], guard: true };
+            let v = View { forms: vec![Form { coefs: vec![1, 0, 0], offset: 0 }, f, Form { coefs: vec![0, 0, 1], offset: 0 }], guard: true, gather: None };
             let y = g.comp(&[4, 2, 3], &[], vec![Arg { src: r, view: v }], None, |v| vec![v[0] + ribt::ir::lit(1.0)]).unwrap();
             let res = std::panic::catch_unwind(|| ribt::runtime::optimize(&g, &[y]).0.count_comps(&[]));
             println!("{k}: optimize {}", if res.is_ok() { "ok (fixed)" } else { "PANICKED (gap 8 still open)" });

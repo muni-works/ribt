@@ -623,7 +623,7 @@ fn bench(a: &Args) -> Result<()> {
         inputs[voc.k_mel] = mel.clone();
         let (og, outs) = ribt::runtime::optimize(&inf.b.g, &[inf.audio]);
         let budget = ErrorBudget::rel(a.get("--budget", 1e-2));
-        let r = tang_bench::ir_msl::tune_precision(&dev.0, og, &outs, &refs(&inputs), &want, budget, iters);
+        let r = ribt::tang_msl::tune_precision(&dev.0, og, &outs, &refs(&inputs), &want, budget, iters);
         let kept: Vec<&str> = r.trials.iter().filter(|t| t.kept).map(|t| t.what.as_str()).collect();
         println!(
             "tune_precision @ {:.0e} (vs f32 GPU output): {:.3} -> {:.3} ms kernel-only, err {:.1e}, {} buffers f16, {} nodes on f16 fragments; {} trials, kept {:?}",
