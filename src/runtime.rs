@@ -84,6 +84,9 @@ mod backend {
         pub fn kernels(&self) -> usize {
             self.0.program.kernels.len()
         }
+        pub fn kernel_buffers(&self) -> Vec<usize> {
+            self.0.program.kernels.iter().map(|k| k.reads.len() + 1).collect()
+        }
         pub fn input_slot(&self, k: usize) -> Option<usize> {
             self.0.program.buffers.iter().position(|b| b.input == Some(k))
         }
@@ -674,6 +677,12 @@ impl Program {
 
     pub fn kernels(&self) -> usize {
         self.exe.kernels()
+    }
+
+    /// Buffers each kernel binds (its reads + its output). Metal allows 31.
+    #[cfg(feature = "metal")]
+    pub fn kernel_buffers(&self) -> Vec<usize> {
+        self.exe.kernel_buffers()
     }
 
     /// Overwrite graph input `k` (a dead input has no buffer: ignored).

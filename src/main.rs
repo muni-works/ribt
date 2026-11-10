@@ -757,6 +757,11 @@ fn stepbench(a: &Args) -> Result<()> {
         1e3 / ms,
         prog.read(&dev, 0)[0]
     );
+    #[cfg(feature = "metal")]
+    {
+        let kb = prog.kernel_buffers();
+        println!("  buffers per kernel: max {}, mean {:.1}; {} graph outputs", kb.iter().max().unwrap(), kb.iter().sum::<usize>() as f64 / kb.len() as f64, tg.outputs.len());
+    }
     Ok(())
 }
 

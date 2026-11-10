@@ -152,33 +152,72 @@ pub fn project(g: &mut TensorGraph, pc: &PConsts, x: TensorId, mel: TensorId) ->
 /// takes gradients w.r.t. them so they are materialized (otherwise the
 /// backward fuses the PCR chain into kernels past Metal's 31 buffers).
 pub fn project_keep(g: &mut TensorGraph, pc: &PConsts, x: TensorId, mel: TensorId, keep: &mut Vec<TensorId>) -> TensorId {
+    let (e, mut lam) = dual_init(g, pc, x, mel);
+    for _ in 0..NEWTON {
+        lam = newton_step(g, pc, x, e, lam, false, keep);
+    }
+    s_of(g, pc, x, lam)
+}
+
+/// [`project`] with the implicit-function-theorem gradient: the `NEWTON`
+/// steps run as in [`project_keep`], the converged λ is detached, and one
+/// more Newton step is taken from it with a detached Hessian. At the
+/// solution that step's derivative is `−H⁻¹ ∂r`, the derivative of the
+/// solve, so the backward is one step's (one PCR chain) whatever `NEWTON`
+/// is. Only that step's intermediates go in `keep`. The value is
+/// [`project`]'s after `NEWTON + 1` steps; the gradient is exact once the
+/// iteration has converged (last step inside the ±4 clamp, exp below its
+/// cap).
+pub fn project_implicit(g: &mut TensorGraph, pc: &PConsts, x: TensorId, mel: TensorId, keep: &mut Vec<TensorId>) -> TensorId {
+    let (e, mut lam) = dual_init(g, pc, x, mel);
+    for _ in 0..NEWTON {
+        lam = newton_step(g, pc, x, e, lam, false, &mut Vec::new());
+    }
+    let fixed = g.detach(lam).unwrap();
+    let lam = newton_step(g, pc, x, e, fixed, true, keep);
+    s_of(g, pc, x, lam)
+}
+
+/// `(exp(mel), λ₀)`: the target and the dual start `mel − ln Fᵀx`.
+fn dual_init(g: &mut TensorGraph, pc: &PConsts, x: TensorId, mel: TensorId) -> (TensorId, TensorId) {
     let e = g.map(&[mel], |v| v[0].exp()).unwrap();
     let fx = to_bands(g, pc.fb, x);
-    let mut lam = g.map(&[mel, fx], |v| v[0] - (v[1] + lit(1e-30)).ln()).unwrap();
-    let s_of = |g: &mut TensorGraph, lam: TensorId| {
-        let fl = to_bins(g, pc.fb, lam);
-        g.map(&[x, fl], |v| {
-            let z = ExprId::select(v[1] - lit(80.0), lit(80.0), v[1]);
-            v[0] * z.exp()
-        })
-        .unwrap()
-    };
-    for _ in 0..NEWTON {
-        let s = s_of(g, lam);
-        let fs = to_bands(g, pc.fb, s);
-        let d = to_bands(g, pc.fb2, s);
-        let up = to_bands(g, pc.fbn, s);
-        let r = g.map(&[e, fs], |v| v[0] - v[1]).unwrap();
-        keep.extend([s, lam]);
-        let step = pcr(g, pc.valid, up, d, r, keep);
-        lam = g
-            .map(&[lam, step], |v| {
-                let c = ExprId::select(v[1] - lit(4.0), lit(4.0), ExprId::select(lit(-4.0) - v[1], lit(-4.0), v[1]));
-                v[0] + c
-            })
-            .unwrap();
+    let lam = g.map(&[mel, fx], |v| v[0] - (v[1] + lit(1e-30)).ln()).unwrap();
+    (e, lam)
+}
+
+/// `s = x ⊙ exp(F λ)`, the exponent capped at 80.
+fn s_of(g: &mut TensorGraph, pc: &PConsts, x: TensorId, lam: TensorId) -> TensorId {
+    let fl = to_bins(g, pc.fb, lam);
+    g.map(&[x, fl], |v| {
+        let z = ExprId::select(v[1] - lit(80.0), lit(80.0), v[1]);
+        v[0] * z.exp()
+    })
+    .unwrap()
+}
+
+/// One Newton step on the dual, `λ + clamp(H⁻¹(e − Fᵀs), ±4)` with
+/// `H = Fᵀ diag(s) F`; `detach_h` stops the gradient through `H`.
+fn newton_step(g: &mut TensorGraph, pc: &PConsts, x: TensorId, e: TensorId, lam: TensorId, detach_h: bool, keep: &mut Vec<TensorId>) -> TensorId {
+    let s = s_of(g, pc, x, lam);
+    let fs = to_bands(g, pc.fb, s);
+    let mut d = to_bands(g, pc.fb2, s);
+    let mut up = to_bands(g, pc.fbn, s);
+    if detach_h {
+        d = g.detach(d).unwrap();
+        up = g.detach(up).unwrap();
     }
-    s_of(g, lam)
+    let r = g.map(&[e, fs], |v| v[0] - v[1]).unwrap();
+    keep.push(s);
+    if !detach_h {
+        keep.push(lam);
+    }
+    let step = pcr(g, pc.valid, up, d, r, keep);
+    g.map(&[lam, step], |v| {
+        let c = ExprId::select(v[1] - lit(4.0), lit(4.0), ExprId::select(lit(-4.0) - v[1], lit(-4.0), v[1]));
+        v[0] + c
+    })
+    .unwrap()
 }
 
 /// RNDVoC's range `|F⁺ e|` (+ε): `z = (FᵀF)⁻¹ e`, `r = F z`.
@@ -327,6 +366,36 @@ mod tests {
     /// f64 interpreter.
     #[test]
     fn project_exact_and_grads() {
+        check(false, 1e-5);
+    }
+
+    /// The same checks on [`project_implicit`]; then its gradients equal
+    /// the ones unrolled through every Newton step, with a smaller backward.
+    /// On this case the two agree to 4e-7 of each gradient's scale (the
+    /// unrolled one is itself 5e-7 from FD), not to rounding, and one
+    /// near-zero coordinate puts the implicit FD figure at 2e-5.
+    #[test]
+    fn implicit_project_matches_unrolled() {
+        let (gi, ni) = check(true, 1e-4);
+        let (gu, nu) = check(false, 1e-5);
+        let mut worst = 0.0f64;
+        for (a, b) in gi.iter().zip(&gu) {
+            let sc = b.iter().fold(1e-3f64, |m, v| m.max(v.abs()));
+            for (u, v) in a.iter().zip(b) {
+                worst = worst.max((u - v).abs() / sc);
+            }
+        }
+        println!("implicit vs unrolled gradients (f64): worst rel {worst:.2e}; backward nodes {ni} vs {nu}");
+        assert!(worst < 1e-5, "{worst}");
+        assert!(nu > 3 * ni);
+    }
+
+    /// Returns the gradients w.r.t. `[θ, a, mel]` and the live node count
+    /// the backward adds to the forward.
+    fn check(implicit: bool, fd_tol: f64) -> (Vec<Vec<f64>>, usize) {
+        let project = |g: &mut TensorGraph, pc: &PConsts, x: TensorId, mel: TensorId| {
+            if implicit { project_implicit(g, pc, x, mel, &mut Vec::new()) } else { super::project(g, pc, x, mel) }
+        };
         let cfg = Config::by_name("checkf0phys").unwrap();
         let (k, m, t, np) = (cfg.bins(), cfg.n_mels, 3usize, n_params(&cfg));
         let mut b = Built::new_pub(&cfg);
@@ -351,6 +420,10 @@ mod tests {
         let loss = g.map(&[l1, l2], |v| v[0] + v[1]).unwrap();
         let wrt = [th, a, mel];
         let grads = g.backward(loss, &wrt).unwrap();
+        // live nodes of loss + gradients, minus the forward's
+        let mut lg = vec![loss];
+        lg.extend(&grads);
+        let added = g.eliminate_dead(&lg).0.nodes().len() - g.eliminate_dead(&[loss]).0.nodes().len();
         let mut rng = Rng::new(3);
         let mut thv = vec![0.0f64; np * t];
         for tt in 0..t {
@@ -403,7 +476,8 @@ mod tests {
                 worst = worst.max(e);
             }
         }
-        println!("FD vs derived backward (f64): worst rel {worst:.2e}");
-        assert!(worst < 1e-5);
+        println!("FD vs derived backward (f64, implicit {implicit}): worst rel {worst:.2e}");
+        assert!(worst < fd_tol, "{worst}");
+        (r0[3..].to_vec(), added)
     }
 }

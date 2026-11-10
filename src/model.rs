@@ -58,6 +58,9 @@ pub struct Config {
     /// projection of |F⁺e|·exp(a) (RNDVoC pseudo-inverse range), 2 = exact
     /// projection of phys_mag(θ)·exp(a) (physics range).
     pub range: u8,
+    /// range > 0: take the projection's gradient implicitly
+    /// (`glottis::project_implicit`) instead of unrolling its Newton steps.
+    pub proj_implicit: bool,
     /// cepstral envelope order (physics range)
     pub n_cep: usize,
     /// §29.5 harmonic source: the lowest `hsrc` STFT bins of a sample-rate
@@ -91,6 +94,7 @@ impl Config {
             mel_weight: 1.0,
             f0: false,
             range: 0,
+            proj_implicit: false,
             n_cep: 30,
             hsrc: 0,
             hid: 0,
@@ -113,6 +117,7 @@ impl Config {
             mel_weight: 1.0,
             f0: false,
             range: 0,
+            proj_implicit: false,
             n_cep: 30,
             hsrc: 0,
             hid: 0,
@@ -136,6 +141,7 @@ impl Config {
             mel_weight: 1.0,
             f0: false,
             range: 0,
+            proj_implicit: false,
             n_cep: 30,
             hsrc: 0,
             hid: 0,
@@ -171,6 +177,8 @@ impl Config {
             "v1f0phys" => Some(Self { f0: true, range: 2, ..Self::v1() }),
             "checkf0pinv" => Some(Self { f0: true, range: 1, n_cep: 12, ..Self::check() }),
             "checkf0phys" => Some(Self { f0: true, range: 2, n_cep: 12, ..Self::check() }),
+            // the same ranges with the implicit projection gradient (for comparison)
+            "v1f0pinvi" | "v1f0physi" | "checkf0pinvi" | "checkf0physi" => Self::by_name(&name[..name.len() - 1]).map(|c| Self { proj_implicit: true, ..c }),
             _ => None,
         }
     }
@@ -628,7 +636,7 @@ fn vocoder(
         let ln100 = 100f64.ln();
         let cand = g.map(&[r, a], |v| v[0] * ExprId::select(v[1] - lit(ln100), lit(ln100), v[1]).exp()).unwrap();
         let mut keep = vec![r, cand];
-        let s = glottis::project_keep(g, &p.pc, cand, p.target, &mut keep);
+        let s = if cfg.proj_implicit { glottis::project_implicit(g, &p.pc, cand, p.target, &mut keep) } else { glottis::project_keep(g, &p.pc, cand, p.target, &mut keep) };
         resid.extend(keep);
         let re = g.map(&[s, ph], |v| v[0] * v[1].cos()).unwrap();
         let im = g.map(&[s, ph], |v| v[0] * v[1].sin()).unwrap();
