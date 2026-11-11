@@ -20,8 +20,6 @@ pub mod persona;
 pub mod runtime;
 #[cfg(feature = "cpu")]
 pub mod tang_cpu;
-#[cfg(feature = "metal")]
-pub mod tang_msl;
 #[cfg(feature = "opencl")]
 pub mod tang_cl;
 pub mod reward;

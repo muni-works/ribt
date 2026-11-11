@@ -3,8 +3,7 @@
 //! optimizer returns.
 //!
 //! One backend per build, chosen by cargo feature:
-//! - `metal` (default): MSL via tang-bench's `ir_msl` runtime, vendored in
-//!   `tang_msl` (macOS).
+//! - `metal` (default): MSL via tang-bench's `ir_msl` runtime (macOS).
 //! - `cuda`: `TensorGraph::to_cuda` (wmma TF32 tiles + WGSL→CUDA transpiled
 //!   kernels) on a small cudarc runtime here. tang-bench's `ir_cuda` keeps
 //!   its buffers private (no input write / swap), so it is not reused.
@@ -31,7 +30,7 @@ compile_error!("enable a backend feature: metal, cuda, wgpu, cpu or opencl");
 ///
 /// A graph with scans gets every live scan's inputs appended to its outputs
 /// (after the given ones, so output indices stay as given). At tang
-/// 73a78dcb a scan reads its inputs as buffers in the layout it was built
+/// c184ec83 a scan reads its inputs as buffers in the layout it was built
 /// with, but `relayout` permutes a scan input's dims and the schedule
 /// inlines a map read only by a scan; an output is exempt from both.
 pub fn optimize(g: &TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
@@ -75,7 +74,7 @@ pub const BACKEND: &str = if cfg!(feature = "metal") {
 
 #[cfg(feature = "metal")]
 mod backend {
-    use crate::tang_msl::{Executable, MslDevice};
+    use tang_bench::ir_msl::{Executable, MslDevice};
     use tang_compile::tensor::msl::FragmentTarget;
     use tang_compile::tensor::{precision, Format, TensorGraph, TensorId};
 
@@ -94,9 +93,8 @@ mod backend {
 
     impl Exe {
         pub fn new(dev: &Device, graph: &TensorGraph, outs: &[TensorId], inputs: &[&[f32]]) -> Self {
-            // no nested contractions: at tang 73a78dcb a contraction nested in a
-            // tile is staged outside its own reduce loop (undeclared `q1_0` in
-            // the vocoder train step's MSL)
+            // no nested contractions: the v1f0phys train step (B8 x 64 frames) is
+            // 45.5 ms with them off, 52.4 ms with them on (tang c184ec83)
             Exe(Executable::new(&dev.0, graph.to_msl_with(outs, &FragmentTarget::APPLE, false), inputs))
         }
         pub fn kernels(&self) -> usize {
