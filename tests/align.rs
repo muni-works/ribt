@@ -231,3 +231,53 @@ fn ctc_forward_sum_gradient_and_limit() {
     eprintln!("utt_host ctc + bin: worst rel {worst:.2e}");
     assert!(worst < 1e-5);
 }
+
+/// The in-graph scan losses on logits fed as data: losses, sharpness, MAS
+/// durations and `∂L/∂z` against the host, for a padded batch whose items
+/// have different `(n, t)`, blank-free and CTC-with-blank.
+#[test]
+fn scan_loss_matches_host() {
+    use ribt::model::{Built, Config, Role};
+    let (nmax, tmax) = (6, 14);
+    let lens = [(6usize, 14usize), (4, 9), (1, 5), (5, 5)];
+    let bsz = lens.len();
+    let mut rng = Rng::new(21);
+    let zv: Vec<f32> = (0..bsz * nmax * tmax).map(|_| (2.0 * rng.normal()) as f32).collect();
+    let (prior, end, fw) = align::scan_data(&lens, nmax, tmax, 1.0);
+    for &(w_bin, blank) in &[(0.0f32, None), (0.7, None), (0.0, Some(-1.0)), (0.7, Some(0.5))] {
+        let mut b = Built::new_pub(&Config::tiny());
+        let z = b.input(&[bsz, nmax, tmax], Role::Data("z"));
+        let sl = align::scan_loss(&mut b, z, blank);
+        let gz = b.g.backward(sl.total, &[z]).unwrap()[0];
+        let inp: Vec<Vec<f64>> = b
+            .inputs
+            .iter()
+            .map(|s| match &s.role {
+                Role::Data("z") => f64s(&zv),
+                Role::Data("prior") => f64s(&prior),
+                Role::Data("end") => f64s(&end),
+                Role::Data("fw") => f64s(&fw),
+                Role::Data("w_bin") => vec![w_bin as f64],
+                Role::Const(v) => f64s(v),
+                r => panic!("{r:?}"),
+            })
+            .collect();
+        let got = b.g.eval(&inp, &[sl.loss_fs, sl.loss_bin, sl.sharp, sl.dur, gz]);
+        let (g, lf, lb, sp, durs) = align::batch_host(&zv, nmax, tmax, &lens, w_bin as f64, 1.0, blank);
+        eprintln!("scan w_bin {w_bin} blank {blank:?}: L_fs {} vs {lf}, L_bin {} vs {lb}, sharp {} vs {sp}", got[0][0], got[1][0], got[2][0]);
+        // fw is 1/(B·t) rounded to f32, so the means agree to f32 rounding
+        assert!((got[0][0] - lf).abs() < 1e-6 * lf.abs().max(1.0));
+        assert!((got[1][0] - lb).abs() < 1e-6 * lb.abs().max(1.0));
+        assert!((got[2][0] - sp).abs() < 1e-6);
+        for (bi, d) in durs.iter().enumerate() {
+            for ni in 0..nmax {
+                let want = d.get(ni).copied().unwrap_or(0) as f64;
+                assert_eq!(got[3][bi * nmax + ni], want, "dur b{bi} n{ni}");
+            }
+        }
+        let worst = got[4].iter().zip(&g).fold(0.0f64, |m, (a, h)| m.max((a - *h as f64).abs()));
+        let scale = g.iter().fold(0.0f32, |m, v| m.max(v.abs())) as f64;
+        eprintln!("  dL/dz: max abs diff {worst:.2e} (scale {scale:.2e})");
+        assert!(worst < 1e-6 * scale, "{worst}");
+    }
+}

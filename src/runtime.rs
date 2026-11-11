@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use tang_compile::tensor::{TensorGraph, TensorId};
+use tang_compile::tensor::{Op, TensorGraph, TensorId};
 
 #[cfg(any(
     all(feature = "metal", feature = "cuda"),
@@ -27,7 +27,25 @@ compile_error!("enable exactly one backend: --no-default-features --features cud
 compile_error!("enable a backend feature: metal, cuda, wgpu, cpu or opencl");
 
 /// The pass pipeline tang's own benches use, then `schedule_auto`.
+///
+/// A graph with scans gets every live scan's inputs appended to its outputs
+/// (after the given ones, so output indices stay as given). At tang
+/// c184ec83 a scan reads its inputs as buffers in the layout it was built
+/// with, but `relayout` permutes a scan input's dims and the schedule
+/// inlines a map read only by a scan; an output is exempt from both.
 pub fn optimize(g: &TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+    let pinned = g.nodes().iter().any(|n| matches!(n.op, Op::Scan(_))).then(|| {
+        let (g, mut outs) = g.eliminate_dead(outs);
+        for i in 0..g.nodes().len() {
+            for t in g.scan_at(TensorId::from_index(i)).map(|s| s.inputs.clone()).into_iter().flatten() {
+                if !outs.contains(&t) {
+                    outs.push(t);
+                }
+            }
+        }
+        (g, outs)
+    });
+    let (g, outs) = pinned.as_ref().map_or((g, outs), |(g, o)| (g, &o[..]));
     let (g, outs) = g.substitute_maps(outs);
     let (g, outs) = g.eliminate_common(&outs);
     let (g, outs) = g.merge_siblings(&outs);
@@ -57,6 +75,7 @@ pub const BACKEND: &str = if cfg!(feature = "metal") {
 #[cfg(feature = "metal")]
 mod backend {
     use tang_bench::ir_msl::{Executable, MslDevice};
+    use tang_compile::tensor::msl::FragmentTarget;
     use tang_compile::tensor::{precision, Format, TensorGraph, TensorId};
 
     pub struct Device(pub MslDevice);
@@ -74,10 +93,15 @@ mod backend {
 
     impl Exe {
         pub fn new(dev: &Device, graph: &TensorGraph, outs: &[TensorId], inputs: &[&[f32]]) -> Self {
-            Exe(Executable::new(&dev.0, graph.to_msl(outs), inputs))
+            // no nested contractions: the v1f0phys train step (B8 x 64 frames) is
+            // 45.5 ms with them off, 52.4 ms with them on (tang c184ec83)
+            Exe(Executable::new(&dev.0, graph.to_msl_with(outs, &FragmentTarget::APPLE, false), inputs))
         }
         pub fn kernels(&self) -> usize {
             self.0.program.kernels.len()
+        }
+        pub fn kernel_buffers(&self) -> Vec<usize> {
+            self.0.program.kernels.iter().map(|k| k.reads.len() + 1).collect()
         }
         pub fn input_slot(&self, k: usize) -> Option<usize> {
             self.0.program.buffers.iter().position(|b| b.input == Some(k))
@@ -109,6 +133,7 @@ mod backend {
                             *o = precision::bf16_bits(x as f64);
                         }
                     }
+                    f => unimplemented!("metal: writing a {f:?} buffer"),
                 }
             }
         }
@@ -668,6 +693,12 @@ impl Program {
 
     pub fn kernels(&self) -> usize {
         self.exe.kernels()
+    }
+
+    /// Buffers each kernel binds (its reads + its output). Metal allows 31.
+    #[cfg(feature = "metal")]
+    pub fn kernel_buffers(&self) -> Vec<usize> {
+        self.exe.kernel_buffers()
     }
 
     /// Overwrite graph input `k` (a dead input has no buffer: ignored).

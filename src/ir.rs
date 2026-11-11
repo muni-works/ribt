@@ -22,7 +22,7 @@ pub fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
 }
 
 pub fn view(forms: Vec<Form>, guard: bool) -> View {
-    View { forms, guard }
+    View { forms, guard, gather: None }
 }
 
 pub fn pick(rank: usize, picks: &[Option<usize>]) -> View {

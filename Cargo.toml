@@ -26,13 +26,13 @@ cpu = ["dep:libloading"]
 opencl = ["dep:libloading"]
 
 [dependencies]
-tang = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12", features = ["std"] }
-tang-expr = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
-tang-compile = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
+tang = { git = "https://github.com/ecto/tang", rev = "c184ec83480f55a2e67187799e283bf43a2a6754", features = ["std"] }
+tang-expr = { git = "https://github.com/ecto/tang", rev = "c184ec83480f55a2e67187799e283bf43a2a6754" }
+tang-compile = { git = "https://github.com/ecto/tang", rev = "c184ec83480f55a2e67187799e283bf43a2a6754" }
 # The Metal runtime for IR programs lives in tang-bench (`ir_msl`) for now.
 # Upstreaming task: move it to tang-compute so nothing depends on a bench crate.
-tang-bench = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12" }
-tang-gpu = { git = "https://github.com/ecto/tang", rev = "1cff792c70bc90ccc0f49eee32c9f2b4436d3b12", optional = true }
+tang-bench = { git = "https://github.com/ecto/tang", rev = "c184ec83480f55a2e67187799e283bf43a2a6754" }
+tang-gpu = { git = "https://github.com/ecto/tang", rev = "c184ec83480f55a2e67187799e283bf43a2a6754", optional = true }
 metal = { version = "0.33", optional = true }
 # same cudarc as tang-bench's `cuda` feature (dynamic libcuda/libnvrtc)
 cudarc = { version = "0.16", features = ["cuda-12080"], optional = true }
