@@ -11,16 +11,25 @@
 //!                    accent are defaults; --pitch / --rate / --accent override)
 //!   ribt-tts voice-blend --a A.voice --b B.voice --t 0.3 --out C.voice   (1−t)·A + t·B (defaults from A)
 //!   ribt-tts voice-fit --run DIR [--ckpt C] --voice INIT.voice --lines FIT.tsv --wav-dir DIR
-//!                    [--held HELD.tsv] [--steps 300] [--lr 3e-3] [--batch 8] [--rank 0] [--check 25] [--no-f0-loss] --out V.voice
+//!                    [--phon P.phon.tsv --durs D.durs.tsv] [--held HELD.tsv] [--steps 300] [--lr 3e-3]
+//!                    [--batch 8] [--rank 0] [--check 25] [--no-f0-loss] --out V.voice
 //!                    embedding fit (rung 2): every weight frozen, AdamW on the 640 voice numbers
 //!                    against the target clips with the training losses (mel L1, duration, pitch,
 //!                    energy, frame F0, voicing). Rows are `id<TAB>…<TAB>text` (text = last column),
-//!                    audio DIR/id.wav at 24 kHz. Durations: no aligner checkpoint ships, so each
-//!                    clip is DTW-aligned once against the init voice's own decoder mel (predicted
-//!                    durations scaled to the clip length), and target frames are counted per token.
+//!                    audio DIR/id.wav at 24 kHz. Durations: with `--phon`/`--durs` (`ribt-align durs`
+//!                    output) the aligner's tokens and durations are used as-is — that is the good
+//!                    path; tokens come from the phon file so they always match the durations.
+//!                    Without them each clip is DTW-aligned once against the init voice's own decoder
+//!                    mel, which demonstrably misaligns (it starved a /d/, "derived" → "arrived").
 //!                    --rank R (rung 3) also trains a rank-R adapter `w + b·a` on each decoder
 //!                    block's two pointwise layers; it is stored in the voice file and folded into
 //!                    the weights at load, so synthesis runs the same graphs at the same cost.
+//!                    Rank is the main quality knob, and it costs voice-file size, not speed:
+//!                    on speaker 7127 (ECAPA cosine to his held-out centroid, 14 sentences, and
+//!                    Whisper base.en WER over 419 words) rank 0 / 4 / 8 / 16 / 32 / 64 / 128 gave
+//!                    0.441 / 0.643 / 0.664 / 0.694 / 0.713 / 0.738 / 0.756 at 4.53 / 4.06 / 4.53 /
+//!                    4.30 / 4.30 / 4.30 / 3.82 % WER (his real clips: 0.789). Voice files are
+//!                    3 KB, 0.5, 1.0, 2.0, 3.9, 7.9 and 15.7 MB; decoder time is unchanged.
 //!   ribt-tts voice-resynth --voc VOC --lines ROWS.tsv --wav-dir DIR --out-dir OUT [--n 4]
 //!                    copy-synthesis: each clip's real log-mel and YIN F0 through the vocoder, i.e.
 //!                    the vocoder's ceiling on that speaker (what is left is the acoustic model's)
@@ -210,10 +219,41 @@ struct Clip {
     mel: Vec<f32>,
 }
 
-/// Load `id<TAB>…<TAB>text` rows: tokens (lilt), audio, F0/energy, log-mel, and
-/// DTW durations against `vparams`' own decoder mel.
-fn load_clips(dev: &Device, tc: &TConfig, vparams: &[Vec<f32>], rows: &str, wav_dir: &Path, fe: &mut Frontend, tts: &mut HashMap<(usize, usize), Tts>) -> Result<Vec<Clip>> {
+/// Aligner output for the fit clips: `id TAB ids` from the phonemized corpus and
+/// `id TAB … TAB durations` from `ribt-align durs`. Tokens come from the phon file,
+/// so a clip's tokens and its durations always line up; the lilt phonemizer
+/// disagrees with the aligner's on ~10% of clips, which is what breaks the pairing.
+fn read_align(phon: Option<&str>, durs: Option<&str>) -> Result<HashMap<String, (Vec<u16>, Vec<u32>)>> {
+    let mut m: HashMap<String, (Vec<u16>, Vec<u32>)> = HashMap::new();
+    if let Some(p) = phon {
+        for l in std::fs::read_to_string(p)?.lines().filter(|l| !l.trim().is_empty()) {
+            let c: Vec<&str> = l.split('\t').collect();
+            let ids: Vec<u16> = c.get(1).map(|s| s.split(' ').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+            m.insert(c[0].into(), (ids, Vec::new()));
+        }
+    }
+    if let Some(d) = durs {
+        for l in std::fs::read_to_string(d)?.lines() {
+            if l.starts_with('#') {
+                continue;
+            }
+            let c: Vec<&str> = l.split('\t').collect();
+            if c.len() < 6 {
+                continue;
+            }
+            let ds: Vec<u32> = c[5].split(' ').filter_map(|x| x.parse().ok()).collect();
+            m.entry(c[0].into()).or_default().1 = ds;
+        }
+    }
+    Ok(m)
+}
+
+/// Load `id<TAB>…<TAB>text` rows: tokens, audio, F0/energy, log-mel, and durations.
+/// With `--phon`/`--durs` the aligner's durations are used as-is; otherwise they
+/// are a DTW of the clip against `vparams`' own decoder mel, which misaligns.
+fn load_clips(dev: &Device, tc: &TConfig, vparams: &[Vec<f32>], rows: &str, wav_dir: &Path, fe: &mut Frontend, tts: &mut HashMap<(usize, usize), Tts>, align: &HashMap<String, (Vec<u16>, Vec<u32>)>) -> Result<Vec<Clip>> {
     let mut out = Vec::new();
+    let (mut n_al, mut n_dtw) = (0, 0);
     for l in std::fs::read_to_string(rows)?.lines().filter(|l| !l.trim().is_empty()) {
         let c: Vec<&str> = l.split('\t').collect();
         let (id, text) = (c[0], c[c.len() - 1]);
@@ -226,12 +266,30 @@ fn load_clips(dev: &Device, tc: &TConfig, vparams: &[Vec<f32>], rows: &str, wav_
             eprintln!("{id}: {frames} frames > {}, skipped", fe.frames);
             continue;
         }
+        let full = fe.run(dev, &[x[..frames * HOP].to_vec()]);
+        let mel: Vec<f32> = (0..tc.n_mels).flat_map(|ch| full[ch * fe.frames..ch * fe.frames + frames].to_vec()).collect();
+        // the aligner's own tokens and durations, when it covered this clip
+        let al = align.get(id).filter(|(t, d)| {
+            let s: usize = d.iter().map(|&v| v as usize).sum();
+            t.len() >= 3 && t.len() == d.len() && s.abs_diff(frames) <= 2
+        });
+        if let Some((t, d)) = al {
+            // the two frame counts are the same wav read twice; absorb a 1–2 frame difference
+            let mut d = d.clone();
+            let s: usize = d.iter().map(|&v| v as usize).sum();
+            let last = d.len() - 2;
+            d[last] = (d[last] as i64 + frames as i64 - s as i64).max(1) as u32;
+            let (f0, en) = frame_feats(&x, frames);
+            let audio: Vec<i16> = x[..frames * HOP].iter().map(|v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
+            out.push(Clip { utt: Utt { id: id.into(), spk: String::new(), toks: t.clone(), durs: d.clone(), audio, f0, en }, mel });
+            n_al += 1;
+            continue;
+        }
+        n_dtw += 1;
         let (ps, _) = ribt::lilt::phonemize(text);
         let mut toks: Vec<u16> = vec![0];
         toks.extend(ribt::lilt::vocab::ids(&ps).iter().map(|&v| v as u16));
         toks.push(0);
-        let full = fe.run(dev, &[x[..frames * HOP].to_vec()]);
-        let mel: Vec<f32> = (0..tc.n_mels).flat_map(|ch| full[ch * fe.frames..ch * fe.frames + frames].to_vec()).collect();
         // predicted durations, scaled to the clip, then DTW of the clip onto that grid
         let n = toks.len().div_ceil(32) * 32;
         let zr = (vec![0.0f32; tc.n_mels * REF_T], vec![0.0f32; REF_T]);
@@ -259,6 +317,9 @@ fn load_clips(dev: &Device, tc: &TConfig, vparams: &[Vec<f32>], rows: &str, wav_
         let (f0, en) = frame_feats(&x, frames);
         let audio: Vec<i16> = x[..frames * HOP].iter().map(|v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
         out.push(Clip { utt: Utt { id: id.into(), spk: String::new(), toks, durs, audio, f0, en }, mel });
+    }
+    if !align.is_empty() {
+        eprintln!("durations: {n_al} clips from the aligner, {n_dtw} by DTW (aligner missing or token count differs)");
     }
     Ok(out)
 }
@@ -288,9 +349,11 @@ pub fn voice_fit(a: &Args) -> Result<()> {
     let mut fe = Frontend::new(&dev, 1, tmax);
     let mut tts = HashMap::new();
     let t0 = Instant::now();
-    let fit = load_clips(&dev, &tc, &all, &a.need("--lines")?, &wav_dir, &mut fe, &mut tts)?;
+    // --phon/--durs: the aligner's tokens and durations, instead of DTW against the model
+    let al = read_align(a.opt("--phon").as_deref(), a.opt("--durs").as_deref())?;
+    let fit = load_clips(&dev, &tc, &all, &a.need("--lines")?, &wav_dir, &mut fe, &mut tts, &al)?;
     let held = match a.opt("--held") {
-        Some(h) => load_clips(&dev, &tc, &all, &h, &wav_dir, &mut fe, &mut tts)?,
+        Some(h) => load_clips(&dev, &tc, &all, &h, &wav_dir, &mut fe, &mut tts, &al)?,
         None => Vec::new(),
     };
     drop(tts);
@@ -490,7 +553,7 @@ pub fn voice_probe(a: &Args) -> Result<()> {
     let dev = Device::new();
     let mut fe = Frontend::new(&dev, 1, a.get("--t", 1024));
     let mut tts = HashMap::new();
-    let clips = load_clips(&dev, &tc, &params, &a.need("--lines")?, &wav_dir, &mut fe, &mut tts)?;
+    let clips = load_clips(&dev, &tc, &params, &a.need("--lines")?, &wav_dir, &mut fe, &mut tts, &HashMap::new())?;
     let zr = (vec![0.0f32; tc.n_mels * REF_T], vec![0.0f32; REF_T]);
     for c in clips.iter().take(a.get("--n", 4)) {
         let (toks, frames) = (&c.utt.toks, c.utt.frames());
