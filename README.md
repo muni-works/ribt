@@ -95,9 +95,54 @@ target/release/ribt-tts synth --run $W --ckpt acoustic.safetensors \
 ```
 
 Swap `synth` for `stream` to hear it chunk by chunk; each committed phoneme and its sample offset
-print to stderr. The knobs are `--pitch` (semitones), `--rate`, and `--accent neutral|midwest|minnesota`.
+print to stderr. The knobs are `--pitch` (semitones), `--rate`, `--pitch-range` (how much the F0
+contour spreads around its mean, 1.0 off), and `--accent neutral|midwest|minnesota`.
 The default voice is up a semitone with a light Upper-Midwest accent: a raised *æ* before *g*, as
 in "bag", and a held *o*. It says "ope" when it should.
+
+## Other voices
+
+Every weight stays shared; a voice is a small file and every voice runs the same compiled graphs.
+
+```bash
+# zero-shot: the reference encoder's vectors for some clips, saved as one voice
+target/release/ribt-tts synth --run $W --ckpt acoustic.safetensors --voc $W/vocoder.safetensors \
+  --ref a.wav+b.wav --save-voice her.voice --lines lines.tsv --out-dir out/
+
+# fit it to a speaker: two stages, about 5 minutes of audio
+target/release/ribt-tts voice-fit --run $W --ckpt acoustic.safetensors --voice her.voice \
+  --lines fit.tsv --held held.tsv --phon corpus.phon.tsv --durs corpus.durs.tsv --wav-dir clips/ \
+  --steps 400 --lr 1e-2 --check 0 --out her_emb.voice
+target/release/ribt-tts voice-fit --run $W --ckpt acoustic.safetensors --voice her_emb.voice \
+  --lines fit.tsv --held held.tsv --phon corpus.phon.tsv --durs corpus.durs.tsv --wav-dir clips/ \
+  --steps 400 --lr 3e-3 --rank 128 --no-f0-loss --check 0 --out her_final.voice
+
+target/release/ribt-tts synth … --voice her_final.voice --lines lines.tsv --out-dir out/
+```
+
+The first stage fits the 640 speaker numbers the acoustic model adds; the second also fits a
+low-rank update on each decoder block's two pointwise layers. The adapter is folded into the
+weights at load, so a voice costs no inference time — rank buys quality with voice-file size:
+
+| adapter rank | none | 8 | 32 | 128 |
+|---|---|---|---|---|
+| similarity to the speaker (ECAPA) | 0.44 | 0.66 | 0.71 | **0.76** |
+| word error rate (Whisper base.en) | 4.5% | 4.5% | 4.3% | 3.8% |
+| voice file | 3 KB | 1 MB | 4 MB | 16 MB |
+
+(Four LibriTTS-R speakers, 14 sentences; the real clips score 0.74–0.79 against themselves.)
+`--rank` is rung 3 of the ladder: vectors only → vectors + adapter → (a multi-voice base model,
+not built). `voice-blend` interpolates two voices — with adapters it stacks their ranks exactly:
+`(1−t)·b₁a₁ + t·b₂a₂ = [(1−t)b₁ | t·b₂]·[a₁; a₂]`. `voice-resynth` and `voice-probe` are the
+diagnostics: copy-synthesis is the vocoder's ceiling, and the probe splits real vs predicted mel
+and F0 on real clips, which is how the buzz in the early male voice was blamed on the flow
+decoder rather than the vocoder or the pitch.
+
+`voice-fit` takes the aligner's durations when `--phon`/`--durs` are given (`ribt-align durs`
+output; tokens come from the phon file so they always match the durations), and falls back to
+aligning each clip by DTW against the model's own mel, which can misalign. `--no-f0-loss` stops
+the adapter from memorizing voicing on a small set of clips. Keep the last step: `--check 0`.
+Never point `--voice` and `--ctx` at the same run — that combination is not wired.
 
 Phonemes only: `target/release/ribt lilt say "Hannah paid \$3.50 at 4:15."`
 
@@ -147,7 +192,7 @@ checksum and setting.
 | `src/model.rs`, `src/gan.rs` | vocoder, log-mel frontend, iSTFT, losses; discriminators for GAN training |
 | `src/align.rs` | the aligner that gives training data its phoneme durations |
 | `src/runtime.rs` | compiles and runs IR programs on the one backend this build has |
-| `src/bin/` | `ribt` (vocoder, lilt), `ribt-tts` (synthesis, streaming, training), `ribt-align`, `ribt-web-export` |
+| `src/bin/` | `ribt` (vocoder, lilt), `ribt-tts` (synthesis, streaming, training, voices), `ribt-align`, `ribt-web-export` |
 | `web/` | the browser build |
 | `data/lilt/` | lexicons, tagger weights and parity goldens, with their licenses in `NOTICE` |
 
