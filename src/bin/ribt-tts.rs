@@ -11,11 +11,14 @@
 //!   ribt-tts synth --run DIR --voc VOCODER.safetensors [--ref REF.wav (default: speaker 5163)] --text "…" --out OUT.wav
 //!                  (--ref A.wav+B.wav+…: one mean speaker vector, the reference encoder's masked mean
 //!                  pool over all the clips' crops laid end to end; §20)
+//!                  [--pitch-range R] token pitch spread around the utterance mean × R (synth)
 //!                  [--pitch SEMITONES] global pitch offset; [--rate R] speak R× faster (synth and stream)
 //!                  (or --lines FILE with one `name<TAB>text` per line and --out-dir DIR)
 //!                  [--flow FLOW.safetensors --nfe 16 [--shortcut] [--temp 1.0] [--seed 0]]  rung-2 decoder
 //!                  [--ctx CTX.safetensors]  context-aware prosody (§25): --lines rows are
 //!                  `name, text, prev, role[, emph]`, see src/bin/ribt-tts/ctx.rs
+//!                  [--voice V.voice] a voice file instead of --ref; [--save-voice V.voice] write
+//!                  the --ref vectors as one (src/bin/ribt-tts/voice.rs, also voice-blend, voice-fit)
 //!   ribt-tts ctx-train …  context path training (§25), src/bin/ribt-tts/ctx.rs
 //!   ribt-tts flow-train | flow-eval   rung 2, see src/bin/ribt-tts/flow_cmd.rs
 //!   ribt-tts voc-pairs …  predicted-mel/real-audio pairs for the vocoder fine-tune (src/bin/ribt-tts/vocft.rs)
@@ -55,6 +58,8 @@ mod ctx;
 mod bodyv;
 #[path = "ribt-tts/reward_cmd.rs"]
 mod reward_cmd;
+#[path = "ribt-tts/voice.rs"]
+mod voice;
 
 pub struct Args(pub Vec<String>);
 
@@ -101,6 +106,10 @@ fn main() -> Result<()> {
         Some("body") => bodyv::body(&a),
         Some("story") => bodyv::story(&a),
         Some("surprise") => bodyv::surprise(&a),
+        Some("voice-blend") => voice::voice_blend(&a),
+        Some("voice-fit") => voice::voice_fit(&a),
+        Some("voice-resynth") => voice::voice_resynth(&a),
+        Some("voice-probe") => voice::voice_probe(&a),
         _ => {
             eprintln!("usage: ribt-tts train|eval|synth|check|bench (see src/bin/ribt-tts.rs)");
             Ok(())
@@ -755,10 +764,15 @@ struct Tts {
 
 impl Tts {
     fn new(dev: &Device, tc: &TConfig, params: &[Vec<f32>], d: Dims) -> Self {
-        let specs = tc.params();
-        let eg = acoustic::enc_graph(tc, d);
+        Self::with(dev, tc, params, d, false)
+    }
+
+    /// `voice`: `params` end with a voice file's two vectors (`acoustic::voice_specs`).
+    fn with(dev: &Device, tc: &TConfig, params: &[Vec<f32>], d: Dims, voice: bool) -> Self {
+        let specs = if voice { acoustic::voice_specs(tc) } else { tc.params() };
+        let eg = acoustic::enc_graph_with(tc, d, voice);
         let ei = acoustic::assemble(&eg.b, &specs, params, None, &[]);
-        let enc = Program::new(dev, &eg.b.g, &[eg.enc.h, eg.enc.ld, eg.enc.pitch, eg.enc.energy, eg.enc.spk_dec], &refs(&ei));
+        let enc = Program::new(dev, &eg.b.g, &[eg.enc.h, eg.enc.ld, eg.enc.pitch, eg.enc.energy, eg.enc.spk_dec, eg.enc.spk_enc], &refs(&ei));
         let dg = acoustic::dec_graph(tc, d);
         let di = acoustic::assemble(&dg.b, &specs, params, None, &[]);
         let dec = Program::new(dev, &dg.b.g, &[dg.mel, dg.f0, dg.hid], &refs(&di));
@@ -773,6 +787,11 @@ impl Tts {
         self.enc.write_input(dev, self.emap["rw"], rw);
         self.enc.run(dev);
         [0, 1, 2, 3, 4].map(|i| self.enc.read(dev, i))
+    }
+
+    /// Encoder-side speaker vector `[d]` of the last `encode`.
+    fn spk_enc(&self, dev: &Device) -> Vec<f32> {
+        self.enc.read(dev, 5)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1053,8 +1072,25 @@ fn synth(a: &Args) -> Result<()> {
     // --rate R speaks R× faster (durations / R, composes with --pace);
     // --pitch S shifts the predicted pitch by S semitones (token pitch, so the
     // decoder's mel and F0 and therefore the vocoder's source follow)
-    let pace: f64 = a.get("--pace", 1.0) / a.get("--rate", 1.0);
-    let pitch_st: f64 = a.get("--pitch", 0.0);
+    // --voice: a voice file's vectors replace the reference encoder; its
+    // pitch / rate / accent are defaults under the CLI flags
+    let voice = a.opt("--voice").map(|p| voice::Voice::load(Path::new(&p))).transpose()?;
+    if let Some(v) = &voice {
+        if ctx_on {
+            return Err(anyhow!("--voice with --ctx: not wired"));
+        }
+        v.merge(&tc, &mut params)?;
+        params.extend([v.se.clone(), v.sd.clone()]);
+        if let (None, Some(ac)) = (a.opt("--accent"), v.meta.get("accent")) {
+            ribt::lilt::accent::set(ac).map_err(|e| anyhow!(e))?;
+        }
+    }
+    let vnum = |k: &str| voice.as_ref().and_then(|v| v.num(k));
+    let pace: f64 = a.get("--pace", 1.0) / a.opt("--rate").and_then(|v| v.parse().ok()).or(vnum("rate")).unwrap_or(1.0);
+    let pitch_st: f64 = a.opt("--pitch").and_then(|v| v.parse().ok()).or(vnum("pitch")).unwrap_or(0.0);
+    let pitch_range: f32 = a.get("--pitch-range", 1.0);
+    let save_voice = a.opt("--save-voice").map(PathBuf::from);
+    let mut saved = false;
     // jobs: (name, text, reference wavs); a lines file may give a per-line
     // reference as a third column, else every --ref is used
     let dflt_refs: Vec<String> = a.opt("--ref").unwrap_or_else(|| DEMO_REF.into()).split(',').map(String::from).collect();
@@ -1137,9 +1173,10 @@ fn synth(a: &Args) -> Result<()> {
         }
         None => None,
     };
-    let nfe: usize = a.get("--nfe", 16);
+    // a voice file's nfe / temp are defaults under the flags
+    let nfe: usize = a.opt("--nfe").and_then(|v| v.parse().ok()).or(vnum("nfe").map(|v| v as usize)).unwrap_or(16);
     let shortcut = a.0.iter().any(|x| x == "--shortcut");
-    let temp: f64 = a.get("--temp", 1.0);
+    let temp: f64 = a.opt("--temp").and_then(|v| v.parse().ok()).or(vnum("temp")).unwrap_or(1.0);
     let seed: u64 = a.get("--seed", 0);
     let chunk = a.opt("--chunk").and_then(|c| c.parse().ok()).map(|c: usize| (c, a.get("--look", 1usize)));
     let mut fcache: HashMap<usize, flow_cmd::Vel> = HashMap::new();
@@ -1166,9 +1203,13 @@ fn synth(a: &Args) -> Result<()> {
         toks.push(0);
         let n = toks.len().div_ceil(32) * 32;
         for r in rlist {
-            let (tag, refmel, rw) = ref_of(r)?;
+            let (tag, refmel, rw) = match &voice {
+                Some(v) => (v.name(), vec![0.0f32; n_mels * rr], vec![0.0f32; rr]),
+                None => ref_of(r)?,
+            };
             let (refmel, rw) = (&refmel, &rw);
-            let tts = cache.entry((n, 0)).or_insert_with(|| Tts::new(&dev, &tc, &params, Dims { batch: 1, n, t: 64, r: rr }));
+            let von = voice.is_some();
+            let tts = cache.entry((n, 0)).or_insert_with(|| Tts::with(&dev, &tc, &params, Dims { batch: 1, n, t: 64, r: rr }, von));
             let (oh, tm) = onehot_rows(&tc, &[&toks], n);
             let t_enc = Instant::now();
             let [h, ld, mut pp, ep, spk] = if ctx_on {
@@ -1186,14 +1227,29 @@ fn synth(a: &Args) -> Result<()> {
             } else {
                 tts.encode(&dev, &oh, &tm, refmel, rw)
             };
+            if let (Some(p), false) = (&save_voice, ctx_on || voice.is_some()) {
+                if !saved {
+                    saved = true;
+                    let mut meta = voice::Voice::meta_from(a, &format!("zero-shot --ref {r}"));
+                    meta.entry("name".into()).or_insert_with(|| tag.clone());
+                    voice::Voice { se: cache[&(n, 0)].spk_enc(&dev), sd: spk.clone(), lora: Vec::new(), meta }.save(p)?;
+                    eprintln!("wrote voice {}", p.display());
+                }
+            }
             shift_pitch(&mut pp, pitch_st, &nm);
+            // --pitch-range R: token pitch spread around the utterance mean × R
+            if pitch_range != 1.0 {
+                let k = toks.len();
+                let mu = pp[..k].iter().sum::<f32>() / k as f32;
+                pp[..k].iter_mut().for_each(|v| *v = mu + (*v - mu) * pitch_range);
+            }
             let enc_ms = t_enc.elapsed().as_secs_f64() * 1e3;
             let durs: Vec<u32> = (0..toks.len()).map(|i| dur_of(ld[i], pace)).collect();
             let frames: usize = durs.iter().sum::<u32>() as usize;
             let t = frames.div_ceil(64) * 64;
             let key = (n, t);
             if !cache.contains_key(&key) {
-                cache.insert(key, Tts::new(&dev, &tc, &params, Dims { batch: 1, n, t, r: rr }));
+                cache.insert(key, Tts::with(&dev, &tc, &params, Dims { batch: 1, n, t, r: rr }, von));
             }
             let tts = cache.get_mut(&key).unwrap();
             let al = acoustic::align_matrix(&[&durs], n, t);

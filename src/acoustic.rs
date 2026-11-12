@@ -381,15 +381,29 @@ pub struct EncOut {
     pub pitch: TensorId,
     pub energy: TensorId,
     /// speaker vectors `[B, d, 1]`, `[B, dd, 1]`
+    pub spk_enc: TensorId,
     pub spk_dec: TensorId,
+}
+
+/// Where the speaker vectors come from: the reference encoder over a mel
+/// crop, or a voice file's vectors (`voice.se` `[d]`, `voice.sd` `[dd]`,
+/// params appended after the base ones, see [`voice_specs`]).
+enum SpkIn {
+    Ref { refmel: TensorId, rw: TensorId },
+    Voice { se: TensorId, sd: TensorId },
 }
 
 struct EncIn {
     onehot: TensorId,
     tmask: TensorId,
-    refmel: TensorId,
-    rw: TensorId,
+    spk: SpkIn,
     pe: TensorId,
+}
+
+/// `v[c]` → `[B, C, 1]`.
+fn bcast(g: &mut TensorGraph, v: TensorId, b: usize) -> TensorId {
+    let c = ir::dims(g, v)[0];
+    g.comp(&[b, c, 1], &[], vec![arg(v, pick(3, &[Some(1)]))], None, |a| vec![a[0]]).unwrap()
 }
 
 fn predictor(g: &mut TensorGraph, p: &Params, name: &str, h: TensorId, tmask: TensorId, ctx: Option<TensorId>) -> TensorId {
@@ -417,21 +431,29 @@ fn predictor(g: &mut TensorGraph, p: &Params, name: &str, h: TensorId, tmask: Te
 }
 
 fn encoder(g: &mut TensorGraph, tc: &TConfig, p: &Params, i: &EncIn, cx: Option<&CtxIn>) -> EncOut {
-    // reference encoder → speaker vectors
-    let r = g.map(&[i.refmel], |v| (v[0] + lit(5.0)) * lit(0.4)).unwrap();
-    let r = ir::conv1d(g, r, p.p("ref.c1.w"), p.p("ref.c1.b"));
-    let r = g.map(&[r], |v| relu(v[0])).unwrap();
-    let r = ir::conv1d(g, r, p.p("ref.c2.w"), p.p("ref.c2.b"));
-    let r = g.map(&[r], |v| relu(v[0])).unwrap();
-    let [b, rh, rt] = ir::dims(g, r)[..] else { panic!() };
-    // masked mean pool: rw[b,0,t] = mask / count
-    let pooled = g
-        .comp(&[b, rh, 1], &[rt], vec![arg(r, pick(4, &[Some(0), Some(1), Some(3)])), arg(i.rw, pick(4, &[Some(0), None, Some(3)]))], Some(Monoid::sum()), |v| vec![v[0] * v[1]])
-        .unwrap();
-    let se = ir::linear(g, pooled, p.p("ref.enc.w"));
-    let se = ir::add_channel(g, se, p.p("ref.enc.b"));
-    let sd = ir::linear(g, pooled, p.p("ref.dec.w"));
-    let spk_dec = ir::add_channel(g, sd, p.p("ref.dec.b"));
+    let (se, spk_dec) = match i.spk {
+        // reference encoder → speaker vectors
+        SpkIn::Ref { refmel, rw } => {
+            let r = g.map(&[refmel], |v| (v[0] + lit(5.0)) * lit(0.4)).unwrap();
+            let r = ir::conv1d(g, r, p.p("ref.c1.w"), p.p("ref.c1.b"));
+            let r = g.map(&[r], |v| relu(v[0])).unwrap();
+            let r = ir::conv1d(g, r, p.p("ref.c2.w"), p.p("ref.c2.b"));
+            let r = g.map(&[r], |v| relu(v[0])).unwrap();
+            let [b, rh, rt] = ir::dims(g, r)[..] else { panic!() };
+            // masked mean pool: rw[b,0,t] = mask / count
+            let pooled = g
+                .comp(&[b, rh, 1], &[rt], vec![arg(r, pick(4, &[Some(0), Some(1), Some(3)])), arg(rw, pick(4, &[Some(0), None, Some(3)]))], Some(Monoid::sum()), |v| vec![v[0] * v[1]])
+                .unwrap();
+            let se = ir::linear(g, pooled, p.p("ref.enc.w"));
+            let se = ir::add_channel(g, se, p.p("ref.enc.b"));
+            let sd = ir::linear(g, pooled, p.p("ref.dec.w"));
+            (se, ir::add_channel(g, sd, p.p("ref.dec.b")))
+        }
+        SpkIn::Voice { se, sd } => {
+            let b = ir::dims(g, i.onehot)[0];
+            (bcast(g, se, b), bcast(g, sd, b))
+        }
+    };
     // text encoder
     let kb = g.map(&[i.tmask], |v| (v[0] - lit(1.0)) * lit(1e4)).unwrap();
     let x = ir::linear(g, i.onehot, p.p("enc.emb"));
@@ -461,7 +483,22 @@ fn encoder(g: &mut TensorGraph, tc: &TConfig, p: &Params, i: &EncIn, cx: Option<
     let ld = predictor(g, p, "dur", h, i.tmask, c);
     let pitch = predictor(g, p, "pitch", h, i.tmask, c);
     let energy = predictor(g, p, "energy", h, i.tmask, c);
-    EncOut { h, ld, pitch, energy, spk_dec }
+    EncOut { h, ld, pitch, energy, spk_enc: se, spk_dec }
+}
+
+/// `linear(x, w)`, plus a voice's low-rank update `b·(a·x)` when the params
+/// carry one for `w` (see [`voice_specs_r`]).
+fn linear_ad(g: &mut TensorGraph, p: &Params, x: TensorId, w: &str) -> TensorId {
+    let y = ir::linear(g, x, p.p(w));
+    let (a, b) = adapter_names(w);
+    match (p.by_name.get(&a), p.by_name.get(&b)) {
+        (Some(&a), Some(&b)) => {
+            let u = ir::linear(g, x, a);
+            let u = ir::linear(g, u, b);
+            add(g, y, u)
+        }
+        _ => y,
+    }
 }
 
 /// Decoder: token states + pitch/energy → frames (via `align`) → log-mel
@@ -493,9 +530,9 @@ fn decoder(
         let q = |s: &str| p.p(&format!("dec.{l}.{s}"));
         let y = ir::dwconv(g, x, q("dw.w"), q("dw.b"));
         let y = ir::layer_norm(g, y, q("ln.g"), q("ln.b"), 1e-6);
-        let y = ir::linear(g, y, q("pw1.w"));
+        let y = linear_ad(g, p, y, &format!("dec.{l}.pw1.w"));
         let y = ir::channel_map(g, y, &[q("pw1.b")], |x, b| ir::gelu(x + b[0]));
-        let y = ir::linear(g, y, q("pw2.w"));
+        let y = linear_ad(g, p, y, &format!("dec.{l}.pw2.w"));
         let y = ir::channel_map(g, y, &[q("pw2.b"), q("gamma")], |x, b| (x + b[0]) * b[1]);
         let x2 = add(g, x, y);
         let x2 = mask_mul(g, x2, fmask);
@@ -562,8 +599,19 @@ pub struct TtsGraph {
 }
 
 pub fn tts_graph(tc: &TConfig, d: Dims) -> TtsGraph {
+    tts_graph_with(tc, d, None)
+}
+
+/// `voice`: speaker vectors from the `voice.*` params instead of the
+/// reference encoder (`refmel`/`rw` stay as unused inputs), with a decoder
+/// adapter of that rank (0: none; see [`voice_specs_r`]).
+fn tts_graph_with(tc: &TConfig, d: Dims, voice: Option<usize>) -> TtsGraph {
     let mut b = Built::new_pub(&Config::tiny());
-    let specs = tc.params();
+    let specs = match voice {
+        Some(r) => voice_specs_r(tc, r),
+        None => tc.params(),
+    };
+    let voice = voice.is_some();
     let p = Params::new(&mut b, &specs);
     let (inp, pe) = enc_inputs(&mut b, tc, d);
     let align = b.input(&[d.batch, d.n, d.t], Role::Data("align"));
@@ -578,7 +626,8 @@ pub fn tts_graph(tc: &TConfig, d: Dims) -> TtsGraph {
     let fw = b.input(&[d.batch, 1, d.t], Role::Data("fw"));
     let vw = b.input(&[d.batch, 1, d.t], Role::Data("vw"));
     let g = &mut b.g;
-    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, refmel: inp.refmel, rw: inp.rw, pe };
+    let spk = if voice { SpkIn::Voice { se: p.p("voice.se"), sd: p.p("voice.sd") } } else { SpkIn::Ref { refmel: inp.refmel, rw: inp.rw } };
+    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, spk, pe };
     let enc = encoder(g, tc, &p, &ei, None);
     let (mel_hat, f0_hat, _) = decoder(g, tc, &p, enc.h, p_tok, e_tok, inp.tmask, align, fmask, enc.spk_dec);
     let inv_m = 1.0 / tc.n_mels as f64;
@@ -647,12 +696,98 @@ pub struct EncGraph {
 }
 
 pub fn enc_graph(tc: &TConfig, d: Dims) -> EncGraph {
+    enc_graph_with(tc, d, false)
+}
+
+/// `voice`: as [`tts_graph_with`] (params [`voice_specs`]; `refmel`/`rw` unused).
+pub fn enc_graph_with(tc: &TConfig, d: Dims, voice: bool) -> EncGraph {
     let mut b = Built::new_pub(&Config::tiny());
-    let p = Params::new(&mut b, &tc.params());
+    let p = Params::new(&mut b, &if voice { voice_specs(tc) } else { tc.params() });
     let (inp, pe) = enc_inputs(&mut b, tc, d);
-    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, refmel: inp.refmel, rw: inp.rw, pe };
+    let spk = if voice { SpkIn::Voice { se: p.p("voice.se"), sd: p.p("voice.sd") } } else { SpkIn::Ref { refmel: inp.refmel, rw: inp.rw } };
+    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, spk, pe };
     let enc = encoder(&mut b.g, tc, &p, &ei, None);
     EncGraph { b, params: p.ids, inp, enc }
+}
+
+// ---------------------------------------------------------------------------
+// voices: a voice is the two speaker vectors the network actually adds
+// (encoder `se` [d], decoder `sd` [dd]); zero-shot it is the reference
+// encoder's output, an embedding fit trains just these against target audio.
+
+pub const VOICE_NAMES: [&str; 2] = ["voice.se", "voice.sd"];
+
+pub fn voice_specs(tc: &TConfig) -> Vec<ParamSpec> {
+    let mut v = tc.params();
+    v.push(ParamSpec::zeros(VOICE_NAMES[0], &[tc.d]));
+    v.push(ParamSpec::zeros(VOICE_NAMES[1], &[tc.dd]));
+    v
+}
+
+/// Base weights a voice's adapter updates: each decoder block's two
+/// pointwise layers.
+pub fn adapter_targets(tc: &TConfig) -> Vec<String> {
+    (0..tc.dec_layers).flat_map(|l| [format!("dec.{l}.pw1.w"), format!("dec.{l}.pw2.w")]).collect()
+}
+
+/// Param names of the adapter on base weight `w` `[o, c]`: `a` `[r, c]`, `b` `[o, r]`.
+pub fn adapter_names(w: &str) -> (String, String) {
+    (format!("voice.lora.{w}.a"), format!("voice.lora.{w}.b"))
+}
+
+/// [`voice_specs`] plus a rank-`rank` adapter `w + b·a` on every
+/// [`adapter_targets`] weight (`b` starts at zero, so the model is unchanged).
+pub fn voice_specs_r(tc: &TConfig, rank: usize) -> Vec<ParamSpec> {
+    let mut v = voice_specs(tc);
+    if rank == 0 {
+        return v;
+    }
+    let base = tc.params();
+    for w in adapter_targets(tc) {
+        let s = base.iter().find(|s| s.name == w).unwrap();
+        let (o, c) = (s.shape[0], s.shape[1]);
+        let (a, b) = adapter_names(&w);
+        v.push(ParamSpec::normal(&a, &[rank, c], (1.0 / c as f64).sqrt()));
+        v.push(ParamSpec::zeros(&b, &[o, rank]));
+    }
+    v
+}
+
+/// Voice fit: the full acoustic losses with every base weight frozen
+/// (inputs, never updated) and AdamW on the voice vectors and, with
+/// `rank > 0`, the decoder adapter.
+pub struct VoiceFit {
+    pub tg: TtsGraph,
+    pub n_base: usize,
+    pub m: Vec<TensorId>,
+    pub v: Vec<TensorId>,
+    pub hyper: TensorId,
+    /// `[grad_norm, losses (7)…, p'(k), m'(k), v'(k), partials…]`, k voice params
+    pub outputs: Vec<TensorId>,
+}
+
+/// `f0_loss: false` leaves the frame F0 / voicing terms out of the objective
+/// (still reported): a few dozen clips let an adapter memorize voicing.
+pub fn voice_fit_graph(tc: &TConfig, d: Dims, rank: usize, f0_loss: bool) -> VoiceFit {
+    let mut tg = tts_graph_with(tc, d, Some(rank));
+    let specs = voice_specs_r(tc, rank);
+    let n_base = tc.params().len();
+    let ids: Vec<TensorId> = tg.params[n_base..].to_vec();
+    let m: Vec<TensorId> = (n_base..specs.len()).map(|i| tg.b.input(&specs[i].shape, Role::AdamM(i))).collect();
+    let v: Vec<TensorId> = (n_base..specs.len()).map(|i| tg.b.input(&specs[i].shape, Role::AdamV(i))).collect();
+    let hyper = tg.b.input(&[6], Role::Hyper);
+    let g = &mut tg.b.g;
+    let wf = tc.w_f0;
+    let obj = if f0_loss { tg.losses[0] } else { g.map(&[tg.losses[0], tg.losses[5], tg.losses[6]], |v| v[0] - lit(wf) * (v[1] + v[2])).unwrap() };
+    let grads = g.backward(obj, &ids).unwrap();
+    let ad = model::adamw_betas(g, &specs[n_base..], &ids, &grads, &m, &v, hyper, 0.9, 0.98);
+    let mut outputs = vec![ad.grad_norm];
+    outputs.extend(&tg.losses);
+    outputs.extend(&ad.new_p);
+    outputs.extend(&ad.new_m);
+    outputs.extend(&ad.new_v);
+    outputs.extend(ad.partials);
+    VoiceFit { tg, n_base, m, v, hyper, outputs }
 }
 
 /// Inference, stage 2: token states (data) + pitch/energy + alignment → mel.
@@ -866,7 +1001,7 @@ pub fn ctx_enc_graph(tc: &TConfig, cc: &CtxConfig, d: Dims, m: usize) -> EncGrap
     let p = Params::new(&mut b, &ctx_specs(tc, cc));
     let (inp, pe) = enc_inputs(&mut b, tc, d);
     let cx = ctx_inputs(&mut b, tc, d, m);
-    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, refmel: inp.refmel, rw: inp.rw, pe };
+    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, spk: SpkIn::Ref { refmel: inp.refmel, rw: inp.rw }, pe };
     let enc = encoder(&mut b.g, tc, &p, &ei, Some(&cx));
     EncGraph { b, params: p.ids, inp, enc }
 }
@@ -905,7 +1040,7 @@ pub fn ctx_train_graph(tc: &TConfig, cc: &CtxConfig, d: Dims, m: usize) -> CtxTr
     let vv: Vec<TensorId> = (n_base..specs.len()).map(|i| b.input(&specs[i].shape, Role::AdamV(i))).collect();
     let hyper = b.input(&[6], Role::Hyper);
     let g = &mut b.g;
-    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, refmel: inp.refmel, rw: inp.rw, pe };
+    let ei = EncIn { onehot: inp.onehot, tmask: inp.tmask, spk: SpkIn::Ref { refmel: inp.refmel, rw: inp.rw }, pe };
     let enc = encoder(g, tc, &p, &ei, Some(&cx));
     let l_dur = wsum(g, enc.ld, Some(ld_tok), tw, |v| (v[0] - v[1]) * (v[0] - v[1]));
     let l_p = wsum(g, enc.pitch, Some(p_tok), tw, |v| (v[0] - v[1]) * (v[0] - v[1]));

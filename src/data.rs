@@ -22,11 +22,14 @@ pub fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
+/// Write mono 16-bit PCM. Not 32-bit float: `hound` emits that as
+/// WAVE_FORMAT_EXTENSIBLE with channel mask 0x1 (SPEAKER_FRONT_LEFT), so players
+/// that honour the mask play it on the left channel only.
 pub fn write_wav(path: &Path, x: &[f32], sr: u32) -> Result<()> {
-    let spec = hound::WavSpec { channels: 1, sample_rate: sr, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+    let spec = hound::WavSpec { channels: 1, sample_rate: sr, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let mut w = hound::WavWriter::create(path, spec)?;
     for &v in x {
-        w.write_sample(v)?;
+        w.write_sample((v * 32768.0).clamp(-32768.0, 32767.0) as i16)?;
     }
     w.finalize()?;
     Ok(())
